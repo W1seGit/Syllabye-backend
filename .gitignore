@@ -1,0 +1,36 @@
+# Python / virtualenv
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Bytecode / cache
+*.log
+.cache/
+.mypy_cache/
+.pytest_cache/
+
+# Environment & secrets
+.env
+.env.*
+
+# Local database
+app.db
+*.sqlite3
+
+# Frontend artifacts / local-only helpers
+chat.html
+
+# Misc
+*.coverage
+htmlcov/
+.coverage.*
