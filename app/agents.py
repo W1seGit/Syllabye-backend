@@ -10,6 +10,7 @@ from langchain_core.tools import StructuredTool
 from . import models
 from .database import get_next_id
 from .llm_providers import get_llm
+from .indexing import search_syllabus_chunks
 
 
 # --- DB helper functions ---
@@ -142,6 +143,7 @@ def make_calendar_tools(
     classes_col = db["classes"]
     events_col = db["events"]
     logs_col = db["tool_call_logs"]
+    syllabus_chunks_col = db["syllabus_chunks"]
 
     def _ensure_default_class_name() -> str:
         default_class = classes_col.find_one({"owner_id": user_id, "name": "Default"})
@@ -282,6 +284,123 @@ def make_calendar_tools(
 
         result = f"Deleted class '{name}' and all related events."
         _log_tool_call("delete_class", {"name": name}, result)
+        return result
+
+    def search_syllabus_tool(
+        class_name: str,
+        query: str,
+        top_k: int = 5,
+    ) -> str:
+        """Search this user's syllabus content for a given class using semantic similarity.
+
+        Use this when you need details from the class syllabus (e.g. exam rules,
+        grading breakdown, assignment policies, or schedule) instead of asking
+        the user to paste them. Always specify the class_name so the correct
+        syllabus is used.
+        """
+
+        cls = classes_col.find_one({"owner_id": user_id, "name": class_name})
+        if not cls:
+            result = f"Class '{class_name}' does not exist for this user."
+            _log_tool_call(
+                "search_syllabus",
+                {"class_name": class_name, "query": query, "top_k": top_k},
+                result,
+            )
+            return result
+
+        # Find syllabus for this class (if any)
+        syllabi_col = db["class_syllabi"]
+        syllabus = syllabi_col.find_one(
+            {"owner_id": user_id, "class_id": cls["id"]}
+        )
+        syllabus_id = syllabus["id"] if syllabus else None
+
+        results = search_syllabus_chunks(
+            db,
+            owner_id=user_id,
+            class_id=cls["id"],
+            syllabus_id=syllabus_id,
+            query=query,
+            top_k=top_k,
+        )
+
+        if not results:
+            result = "No matching syllabus chunks found."
+            _log_tool_call(
+                "search_syllabus",
+                {"class_name": class_name, "query": query, "top_k": top_k},
+                result,
+            )
+            return result
+
+        lines: List[str] = []
+        for doc in results:
+            score = doc.get("score", 0.0)
+            text = str(doc.get("text", "")).strip()
+            lines.append(f"score={score:.3f} | {text}")
+
+        result = "\n".join(lines)
+        _log_tool_call(
+            "search_syllabus",
+            {"class_name": class_name, "query": query, "top_k": top_k},
+            result,
+        )
+        return result
+
+    def search_all_syllabi_tool(
+        query: str,
+        top_k: int = 5,
+    ) -> str:
+        """Search this user's syllabus content across ALL classes using semantic similarity.
+
+        Use this when the user does not clearly specify a class name but asks
+        about something that might be in any syllabus (e.g. "When is the unit 3
+        exam about environmental science?"). The results will include which
+        class each chunk came from so you can explain that back to the user.
+        """
+
+        results = search_syllabus_chunks(
+            db,
+            owner_id=user_id,
+            class_id=None,
+            syllabus_id=None,
+            query=query,
+            top_k=top_k,
+        )
+
+        if not results:
+            result = "No matching syllabus chunks found across any classes."
+            _log_tool_call(
+                "search_all_syllabi",
+                {"query": query, "top_k": top_k},
+                result,
+            )
+            return result
+
+        # Preload class names for pretty formatting
+        class_ids = {doc.get("class_id") for doc in results if "class_id" in doc}
+        class_map: Dict[int, str] = {}
+        if class_ids:
+            for cls_doc in classes_col.find(
+                {"owner_id": user_id, "id": {"$in": list(class_ids)}}
+            ):
+                class_map[cls_doc["id"]] = cls_doc.get("name", str(cls_doc["id"]))
+
+        lines: List[str] = []
+        for doc in results:
+            score = doc.get("score", 0.0)
+            text = str(doc.get("text", "")).strip()
+            cid = doc.get("class_id")
+            cname = class_map.get(cid, f"class_id={cid}") if cid is not None else "unknown class"
+            lines.append(f"class={cname} | score={score:.3f} | {text}")
+
+        result = "\n".join(lines)
+        _log_tool_call(
+            "search_all_syllabi",
+            {"query": query, "top_k": top_k},
+            result,
+        )
         return result
 
     def create_event_tool(
@@ -593,6 +712,17 @@ def make_calendar_tools(
         name="list_events",
         description=list_events_tool.__doc__ or "List events.",
     )
+    search_syllabus = StructuredTool.from_function(
+        func=search_syllabus_tool,
+        name="search_syllabus",
+        description=search_syllabus_tool.__doc__ or "Search syllabus content.",
+    )
+    search_all_syllabi = StructuredTool.from_function(
+        func=search_all_syllabi_tool,
+        name="search_all_syllabi",
+        description=search_all_syllabi_tool.__doc__
+        or "Search syllabus content across all classes.",
+    )
 
     return [
         list_classes,
@@ -603,6 +733,8 @@ def make_calendar_tools(
         update_event,
         delete_event,
         list_events,
+        search_syllabus,
+        search_all_syllabi,
     ]
 
 
@@ -677,6 +809,16 @@ CLASSES
   safely inferred.
 - You may create a new class if the user clearly wants one with that name, or
   explicitly agrees.
+
+SYLLABUS SEARCH
+- When the user asks about details that likely live in a syllabus (exam dates,
+  grading policy, assignment rules, etc.), prefer using the syllabus search
+  tools instead of asking them to paste the syllabus.
+- If the user clearly names a class, use search_syllabus with that class.
+- If the user does NOT clearly name a class, but the question could match any
+  class, use search_all_syllabi. When you answer, mention which class syllabus
+  you used so the user understands the context (e.g. "According to your
+  Science syllabus...").
 
 ASSIGNMENT TYPES
 - Normalize to: Homework, Reading, Lab, Project, Paper, Quiz, Exam,
