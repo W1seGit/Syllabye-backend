@@ -293,7 +293,7 @@ def make_calendar_tools(
 
     def create_event_tool(
         title: str,
-        due_iso: str,
+        due_iso: str | None = None,
         location: str | None = None,
         description: str | None = None,
         assignment_type: str | None = None,
@@ -308,6 +308,28 @@ def make_calendar_tools(
         The class_name MUST be one of the user's classes; if you need a new class,
         call create_class_tool first.
         """
+
+        if not due_iso:
+            msg = (
+                "Missing due_iso for create_event. "
+                "Ask the user for a specific due date and time first, "
+                "then call this tool again with due_iso as an ISO-8601 string."
+            )
+            _log_tool_call(
+                "create_event",
+                {
+                    "title": title,
+                    "due_iso": due_iso,
+                    "location": location,
+                    "description": description,
+                    "assignment_type": assignment_type,
+                    "class_name": class_name,
+                    "status": status,
+                    "priority": priority,
+                },
+                msg,
+            )
+            return msg
 
         due = datetime.fromisoformat(due_iso)
         validated_class = _validate_class_name(class_name)

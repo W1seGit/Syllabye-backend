@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -31,6 +32,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Conversation-UUID"],
 )
 
 
@@ -81,17 +83,16 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
 # --- Chat endpoint using LangChain agent ---
 
 
-@app.post("/chat", response_model=schemas.ChatResponse)
+@app.post("/chat")
 def chat(
     payload: schemas.ChatRequest,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    """Chat endpoint that routes user messages through the LangChain calendar agent.
+    """Streaming chat endpoint using the same calendar agent.
 
-    The agent is scoped to the authenticated user and can add, update, delete,
-    and list events only for that user.
-    Each conversation has a UUID and messages have an increasing index per conversation.
+    Streams the assistant reply incrementally while still persisting
+    the final messages and conversation state when complete.
     """
 
     conversation: models.Conversation | None = None
@@ -131,7 +132,6 @@ def chat(
     if len(history_messages) > MAX_HISTORY_TURNS:
         history_messages = history_messages[-MAX_HISTORY_TURNS:]
 
-    # Next user message index for this conversation
     next_index = 1
     if db_history:
         next_index = db_history[-1].message_index + 1
@@ -147,8 +147,8 @@ def chat(
         message_index=next_index,
     )
 
+    # Call the agent once to get the full reply, then stream it to the client.
     result = agent.invoke({"messages": messages_input})
-
     messages = result.get("messages") or []
     if not messages:
         raise HTTPException(status_code=500, detail="Agent returned no messages")
@@ -159,30 +159,152 @@ def chat(
     else:
         reply_text = last_message.get("content", "")
 
-    user_msg = models.ChatMessage(
-        role="user",
-        content=payload.message,
-        message_index=next_index,
-        conversation_id=conversation.id,
-        conversation_uuid=conversation.uuid,
-        owner_id=current_user.id,
-    )
-    assistant_msg = models.ChatMessage(
-        role="assistant",
-        content=reply_text,
-        message_index=next_index + 1,
-        conversation_id=conversation.id,
-        conversation_uuid=conversation.uuid,
-        owner_id=current_user.id,
-    )
-    db.add(user_msg)
-    db.add(assistant_msg)
-    db.commit()
+    def event_stream():
+        try:
+            # Stream the reply in small chunks so the UI can update incrementally.
+            chunk_size = 128
+            for i in range(0, len(reply_text), chunk_size):
+                yield reply_text[i : i + chunk_size]
+        finally:
+            # Persist messages once the stream ends (successfully or not)
+            user_msg = models.ChatMessage(
+                role="user",
+                content=payload.message,
+                message_index=next_index,
+                conversation_id=conversation.id,
+                conversation_uuid=conversation.uuid,
+                owner_id=current_user.id,
+            )
+            assistant_msg = models.ChatMessage(
+                role="assistant",
+                content=reply_text,
+                message_index=next_index + 1,
+                conversation_id=conversation.id,
+                conversation_uuid=conversation.uuid,
+                owner_id=current_user.id,
+            )
+            db.add(user_msg)
+            db.add(assistant_msg)
+            db.commit()
 
-    return schemas.ChatResponse(
-        reply=reply_text,
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/plain",
+        headers={"X-Conversation-UUID": conversation.uuid},
+    )
+
+
+@app.post("/chat/experimental-stream")
+async def chat_experimental_stream(
+    payload: schemas.ChatRequest,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Experimental true streaming chat endpoint using agent streaming events.
+
+    This keeps all agent tooling and DB logging but relies on LangChain's
+    streaming event API, which may change in future versions.
+    """
+
+    conversation: models.Conversation | None = None
+    if payload.conversation_uuid:
+        conversation = (
+            db.query(models.Conversation)
+            .filter(
+                models.Conversation.owner_id == current_user.id,
+                models.Conversation.uuid == payload.conversation_uuid,
+            )
+            .first()
+        )
+        if not conversation:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Conversation not found for this user.",
+            )
+    else:
+        conversation = models.Conversation(owner_id=current_user.id)
+        db.add(conversation)
+        db.commit()
+        db.refresh(conversation)
+
+    db_history = (
+        db.query(models.ChatMessage)
+        .filter(
+            models.ChatMessage.owner_id == current_user.id,
+            models.ChatMessage.conversation_id == conversation.id,
+        )
+        .order_by(models.ChatMessage.message_index.asc())
+        .all()
+    )
+
+    history_messages = [
+        {"role": m.role, "content": m.content} for m in db_history
+    ]
+    if len(history_messages) > MAX_HISTORY_TURNS:
+        history_messages = history_messages[-MAX_HISTORY_TURNS:]
+
+    next_index = 1
+    if db_history:
+        next_index = db_history[-1].message_index + 1
+
+    messages_input = history_messages + [
+        {"role": "user", "content": payload.message},
+    ]
+
+    agent = get_calendar_agent(
+        db=db,
+        user_id=current_user.id,
         conversation_uuid=conversation.uuid,
-        message_index=assistant_msg.message_index,
+        message_index=next_index,
+    )
+
+    async def event_stream():
+        full_reply = ""
+        try:
+            # NOTE: This uses LangChain's experimental streaming event API.
+            async for event in agent.astream_events({"messages": messages_input}):
+                event_type = event.get("event")
+                if event_type != "on_chat_model_stream":
+                    continue
+                data = event.get("data") or {}
+                chunk = data.get("chunk")
+                if chunk is None:
+                    continue
+                if hasattr(chunk, "content"):
+                    text = chunk.content
+                else:
+                    text = chunk.get("content", "")
+                if not text:
+                    continue
+                full_reply_local = full_reply + text
+                # send delta straight to client
+                yield text
+                full_reply = full_reply_local
+        finally:
+            user_msg = models.ChatMessage(
+                role="user",
+                content=payload.message,
+                message_index=next_index,
+                conversation_id=conversation.id,
+                conversation_uuid=conversation.uuid,
+                owner_id=current_user.id,
+            )
+            assistant_msg = models.ChatMessage(
+                role="assistant",
+                content=full_reply,
+                message_index=next_index + 1,
+                conversation_id=conversation.id,
+                conversation_uuid=conversation.uuid,
+                owner_id=current_user.id,
+            )
+            db.add(user_msg)
+            db.add(assistant_msg)
+            db.commit()
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/plain",
+        headers={"X-Conversation-UUID": conversation.uuid},
     )
 
 
