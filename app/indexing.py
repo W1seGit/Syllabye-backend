@@ -35,6 +35,20 @@ def _get_chunks_from_pdf(path: str) -> List[str]:
     return [c for c in chunks if c.strip()]
 
 
+def _get_chunks_from_image(path: str) -> List[str]:
+    if DocumentConverter is None or HybridChunker is None:
+        raise RuntimeError(
+            "Docling is not installed. Please add 'docling' to requirements.txt and install it."
+        )
+    converter = DocumentConverter()
+    result = converter.convert(path)
+    dl_doc = result.document
+
+    chunker = HybridChunker()
+    chunks = [chunk.text for chunk in chunker.chunk(dl_doc=dl_doc)]
+    return [c for c in chunks if c.strip()]
+
+
 def _embed_texts(texts: List[str]) -> List[List[float]]:
     if not texts:
         return []
@@ -151,6 +165,32 @@ def index_syllabus_pdf(
         syllabus_id=syllabus_id,
         source_type="syllabus_pdf",
         chunks=chunks,
+    )
+
+
+def index_syllabus_images(
+    db: Database,
+    *,
+    owner_id: int,
+    class_id: int,
+    syllabus_id: int,
+    image_paths: List[str],
+) -> None:
+    all_chunks: List[str] = []
+    for path in image_paths:
+        try:
+            chunks = _get_chunks_from_image(path)
+        except Exception:
+            continue
+        all_chunks.extend(chunks)
+
+    _index_chunks(
+        db,
+        owner_id=owner_id,
+        class_id=class_id,
+        syllabus_id=syllabus_id,
+        source_type="syllabus_image",
+        chunks=all_chunks,
     )
 
 

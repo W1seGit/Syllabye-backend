@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 
 from .database import get_db, get_next_id
 from . import models, schemas
-from .indexing import index_syllabus_text, index_syllabus_pdf
+from .indexing import index_syllabus_text, index_syllabus_pdf, index_syllabus_images
 from .auth import get_current_user, get_password_hash, authenticate_user, create_access_token
 from .agents import get_calendar_agent
 
@@ -571,6 +571,8 @@ def upload_class_syllabus_images(
     images_col = db["class_syllabus_images"]
     now = datetime.utcnow()
 
+    image_paths: List[str] = []
+
     for f in files:
         ext = os.path.splitext(f.filename or "")[1] or ".png"
         filename = f"img_{datetime.utcnow().timestamp()}_{f.filename}"
@@ -579,6 +581,8 @@ def upload_class_syllabus_images(
         with open(dest_path, "wb") as out_file:
             content = f.file.read()
             out_file.write(content)
+
+        image_paths.append(dest_path)
 
         img_id = get_next_id("class_syllabus_images")
         img: models.ClassSyllabusImage = {
@@ -595,6 +599,16 @@ def upload_class_syllabus_images(
         {"_id": syllabus["_id"]},
         {"$set": {"updated_at": datetime.utcnow()}},
     )
+
+    if image_paths:
+        user_id = _get_user_id(current_user)
+        index_syllabus_images(
+            db,
+            owner_id=user_id,
+            class_id=class_id,
+            syllabus_id=syllabus["id"],
+            image_paths=image_paths,
+        )
 
     updated = syllabi.find_one({"_id": syllabus["_id"]})
     return _syllabus_to_response(db, cast(models.ClassSyllabus, updated))
