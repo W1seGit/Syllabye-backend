@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 from typing import List
+import json
 
 from sqlalchemy.orm import Session
 
@@ -128,6 +129,74 @@ def db_list_events(
 def make_calendar_tools(db: Session, user_id: int):
     """Create per-user tools so the LLM can never access other users' events."""
 
+    def _ensure_default_class_name() -> str:
+        default_class = (
+            db.query(models.Class)
+            .filter(models.Class.owner_id == user_id, models.Class.name == "Default")
+            .first()
+        )
+        if not default_class:
+            default_class = models.Class(name="Default", owner_id=user_id)
+            db.add(default_class)
+            db.commit()
+        return "Default"
+
+    def _validate_class_name(name: str | None) -> str:
+        if name is None:
+            return _ensure_default_class_name()
+        existing = (
+            db.query(models.Class)
+            .filter(models.Class.owner_id == user_id, models.Class.name == name)
+            .first()
+        )
+        if not existing:
+            return (
+                "INVALID_CLASS"
+            )
+        return name
+
+    def _log_tool_call(tool_name: str, arguments: dict, result: str) -> None:
+        log = models.ToolCallLog(
+            tool_name=tool_name,
+            arguments=json.dumps(arguments, default=str),
+            result=result,
+            owner_id=user_id,
+        )
+        db.add(log)
+        db.commit()
+
+    def list_classes_tool() -> str:
+        """List the user's classes by name. Use this before assigning a class_name to a task."""
+
+        classes = (
+            db.query(models.Class)
+            .filter(models.Class.owner_id == user_id)
+            .order_by(models.Class.name.asc())
+            .all()
+        )
+        if not classes:
+            return "No classes found for this user."
+        return "\n".join(f"id={c.id} | {c.name}" for c in classes)
+
+    def create_class_tool(name: str) -> str:
+        """Create a new class for this user (e.g. "Math", "Biology").
+
+        Use this if you need a class that does not yet exist before creating a task.
+        """
+
+        existing = (
+            db.query(models.Class)
+            .filter(models.Class.owner_id == user_id, models.Class.name == name)
+            .first()
+        )
+        if existing:
+            return f"Class '{name}' already exists."
+        new_class = models.Class(name=name, owner_id=user_id)
+        db.add(new_class)
+        db.commit()
+        db.refresh(new_class)
+        return f"Created class id={new_class.id} name='{new_class.name}'"
+
     def create_event_tool(
         title: str,
         due_iso: str,
@@ -141,16 +210,42 @@ def make_calendar_tools(db: Session, user_id: int):
         """Create a new calendar task/event for the current user.
 
         Treat "due_iso" as the single due date & time (no separate start/end).
-        Use a standardized title format: "<Subject> - <Assignment Type>: <Short Description>".
-        Examples:
-        - "English - Homework: Read Chapter 3"
-        - "Math - Exam: Midterm 1"
+        Always set status (default to "pending") and a reasonable priority if not provided.
+        The class_name MUST be one of the user's classes; if you need a new class,
+        call create_class_tool first.
         """
 
         due = datetime.fromisoformat(due_iso)
         start = due
         end = due
-        return db_create_event(
+
+        validated_class = _validate_class_name(class_name)
+        if validated_class == "INVALID_CLASS":
+            msg = (
+                "Class name does not exist for this user. "
+                "Call list_classes_tool to inspect existing classes and "
+                "create_class_tool to create a new one before creating the event."
+            )
+            _log_tool_call(
+                "create_event",
+                {
+                    "title": title,
+                    "due_iso": due_iso,
+                    "location": location,
+                    "description": description,
+                    "assignment_type": assignment_type,
+                    "class_name": class_name,
+                    "status": status,
+                    "priority": priority,
+                },
+                msg,
+            )
+            return msg
+
+        final_status = status or "pending"
+        final_priority = priority or "normal"
+
+        result = db_create_event(
             db,
             user_id,
             title=title,
@@ -159,10 +254,26 @@ def make_calendar_tools(db: Session, user_id: int):
             location=location,
             description=description,
             assignment_type=assignment_type,
-            class_name=class_name,
-            status=status,
-            priority=priority,
+            class_name=validated_class,
+            status=final_status,
+            priority=final_priority,
         )
+
+        _log_tool_call(
+            "create_event",
+            {
+                "title": title,
+                "due_iso": due_iso,
+                "location": location,
+                "description": description,
+                "assignment_type": assignment_type,
+                "class_name": validated_class,
+                "status": final_status,
+                "priority": final_priority,
+            },
+            result,
+        )
+        return result
 
     def update_event_tool(
         event_id: int,
@@ -189,7 +300,36 @@ def make_calendar_tools(db: Session, user_id: int):
         else:
             start = None
             end = None
-        return db_update_event(
+
+        validated_class: str | None
+        if class_name is not None:
+            validated_class = _validate_class_name(class_name)
+            if validated_class == "INVALID_CLASS":
+                msg = (
+                    "Class name does not exist for this user. "
+                    "Call list_classes_tool to inspect existing classes and "
+                    "create_class_tool to create a new one before updating the event."
+                )
+                _log_tool_call(
+                    "update_event",
+                    {
+                        "event_id": event_id,
+                        "title": title,
+                        "due_iso": due_iso,
+                        "location": location,
+                        "description": description,
+                        "assignment_type": assignment_type,
+                        "class_name": class_name,
+                        "status": status,
+                        "priority": priority,
+                    },
+                    msg,
+                )
+                return msg
+        else:
+            validated_class = None
+
+        result = db_update_event(
             db,
             user_id,
             event_id=event_id,
@@ -199,10 +339,27 @@ def make_calendar_tools(db: Session, user_id: int):
             location=location,
             description=description,
             assignment_type=assignment_type,
-            class_name=class_name,
+            class_name=validated_class,
             status=status,
             priority=priority,
         )
+
+        _log_tool_call(
+            "update_event",
+            {
+                "event_id": event_id,
+                "title": title,
+                "due_iso": due_iso,
+                "location": location,
+                "description": description,
+                "assignment_type": assignment_type,
+                "class_name": validated_class,
+                "status": status,
+                "priority": priority,
+            },
+            result,
+        )
+        return result
 
     def delete_event_tool(event_id: int) -> str:
         """Delete one calendar event for the current user.
@@ -210,7 +367,9 @@ def make_calendar_tools(db: Session, user_id: int):
         Use only after confirming which event to delete.
         """
 
-        return db_delete_event(db, user_id, event_id=event_id)
+        result = db_delete_event(db, user_id, event_id=event_id)
+        _log_tool_call("delete_event", {"event_id": event_id}, result)
+        return result
 
     def list_events_tool(
         date_iso: str | None = None,
@@ -238,14 +397,36 @@ def make_calendar_tools(db: Session, user_id: int):
                 date = None
         events = db_list_events(db, user_id, date=date, title_query=title_query)
         if not events:
-            return "No events found."
+            result = "No events found."
+            _log_tool_call(
+                "list_events",
+                {"date_iso": date_iso, "title_query": title_query},
+                result,
+            )
+            return result
         lines = []
         for e in events:
             lines.append(
                 f"id={e.id} | {e.title} | {e.start.isoformat()} - {e.end.isoformat()} | {e.location or ''}"
             )
-        return "\n".join(lines)
+        result = "\n".join(lines)
+        _log_tool_call(
+            "list_events",
+            {"date_iso": date_iso, "title_query": title_query},
+            result,
+        )
+        return result
 
+    list_classes = StructuredTool.from_function(
+        func=list_classes_tool,
+        name="list_classes",
+        description=list_classes_tool.__doc__ or "List classes.",
+    )
+    create_class = StructuredTool.from_function(
+        func=create_class_tool,
+        name="create_class",
+        description=create_class_tool.__doc__ or "Create a class.",
+    )
     create_event = StructuredTool.from_function(
         func=create_event_tool,
         name="create_event",
@@ -267,14 +448,14 @@ def make_calendar_tools(db: Session, user_id: int):
         description=list_events_tool.__doc__ or "List events.",
     )
 
-    return [create_event, update_event, delete_event, list_events]
+    return [list_classes, create_class, create_event, update_event, delete_event, list_events]
 
 
 # --- Agent factory ---
 
 
 def get_calendar_agent(db: Session, user_id: int):
-    llm = ChatOpenAI(model="gpt-4.1-nano", temperature=0)
+    llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0)
 
     tools = make_calendar_tools(db, user_id)
 
@@ -291,6 +472,9 @@ def get_calendar_agent(db: Session, user_id: int):
         "Prefer concise but specific descriptions that clarify what must be done. "
         "Ask clarifying questions when dates, times, or which task to modify are ambiguous. "
         "Use list_events to inspect events (and show IDs) before updating or deleting them. "
+        "Classes: every task must belong to a valid class for the user. The default class name is 'Default'. "
+        "Use list_classes to see existing classes, create_class to add new ones (e.g., 'Math'), "
+        "and only then assign class_name when creating or updating events. "
     )
 
     agent = create_agent(

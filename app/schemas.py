@@ -22,10 +22,24 @@ class UserOut(BaseModel):
         orm_mode = True
 
 
+class ClassBase(BaseModel):
+    name: str
+
+
+class ClassCreate(ClassBase):
+    pass
+
+
+class ClassOut(ClassBase):
+    id: int
+
+    class Config:
+        orm_mode = True
+
+
 class EventBase(BaseModel):
     title: str
-    start: datetime
-    end: datetime
+    due: datetime
     location: Optional[str] = None
     description: Optional[str] = None
     assignment_type: Optional[str] = None
@@ -40,8 +54,7 @@ class EventCreate(EventBase):
 
 class EventUpdate(BaseModel):
     title: Optional[str] = None
-    start: Optional[datetime] = None
-    end: Optional[datetime] = None
+    due: Optional[datetime] = None
     location: Optional[str] = None
     description: Optional[str] = None
     assignment_type: Optional[str] = None
