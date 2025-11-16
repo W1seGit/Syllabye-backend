@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
 from pydantic import BaseModel, constr
 
@@ -93,3 +93,26 @@ class ChatMessageOut(BaseModel):
 
     class Config:
         orm_mode = True
+
+
+class ClassSyllabusImageOut(BaseModel):
+    id: int
+    file_path: str
+
+    class Config:
+        orm_mode = True
+
+
+class ClassSyllabusOut(BaseModel):
+    id: int
+    class_id: int
+    text: Optional[str] = None
+    pdf_path: Optional[str] = None
+    images: List[ClassSyllabusImageOut] = []
+
+    class Config:
+        orm_mode = True
+
+
+class ClassSyllabusTextUpdate(BaseModel):
+    text: Optional[str] = None

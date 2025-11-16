@@ -18,6 +18,7 @@ class User(Base):
     chat_messages = relationship("ChatMessage", back_populates="owner", cascade="all, delete-orphan")
     tool_calls = relationship("ToolCallLog", back_populates="owner", cascade="all, delete-orphan")
     conversations = relationship("Conversation", back_populates="owner", cascade="all, delete-orphan")
+    syllabi = relationship("ClassSyllabus", back_populates="owner", cascade="all, delete-orphan")
 
 
 class Class(Base):
@@ -31,6 +32,39 @@ class Class(Base):
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    syllabus = relationship("ClassSyllabus", back_populates="class_", uselist=False, cascade="all, delete-orphan")
+
+
+class ClassSyllabus(Base):
+    __tablename__ = "class_syllabi"
+
+    id = Column(Integer, primary_key=True, index=True)
+    text = Column(Text, nullable=True)
+    pdf_path = Column(String, nullable=True)
+
+    class_id = Column(Integer, ForeignKey("classes.id", ondelete="CASCADE"), nullable=False, index=True)
+    class_ = relationship("Class", back_populates="syllabus")
+
+    owner_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    owner = relationship("User", back_populates="syllabi")
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    images = relationship("ClassSyllabusImage", back_populates="syllabus", cascade="all, delete-orphan")
+
+
+class ClassSyllabusImage(Base):
+    __tablename__ = "class_syllabus_images"
+
+    id = Column(Integer, primary_key=True, index=True)
+    file_path = Column(String, nullable=False)
+
+    syllabus_id = Column(Integer, ForeignKey("class_syllabi.id", ondelete="CASCADE"), nullable=False, index=True)
+    syllabus = relationship("ClassSyllabus", back_populates="images")
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
 class Event(Base):

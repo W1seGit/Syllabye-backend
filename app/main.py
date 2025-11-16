@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File
 from fastapi.responses import StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,6 +6,8 @@ from sqlalchemy.orm import Session
 from typing import List, Dict
 from datetime import datetime, date
 from dotenv import load_dotenv
+import os
+
 
 from .database import Base, engine, get_db
 from . import models, schemas
@@ -504,6 +506,199 @@ def delete_class(
     db.commit()
 
     return {"detail": "Class and related events deleted"}
+
+
+SYLLABUS_STORAGE_DIR = "syllabus_files"
+
+
+def _ensure_syllabus_storage_dir() -> None:
+    if not os.path.exists(SYLLABUS_STORAGE_DIR):
+        os.makedirs(SYLLABUS_STORAGE_DIR, exist_ok=True)
+
+
+def _get_or_create_syllabus(db: Session, current_user: models.User, class_id: int) -> models.ClassSyllabus:
+    cls = (
+        db.query(models.Class)
+        .filter(models.Class.id == class_id, models.Class.owner_id == current_user.id)
+        .first()
+    )
+    if not cls:
+        raise HTTPException(status_code=404, detail="Class not found")
+
+    syllabus = (
+        db.query(models.ClassSyllabus)
+        .filter(
+            models.ClassSyllabus.class_id == class_id,
+            models.ClassSyllabus.owner_id == current_user.id,
+        )
+        .first()
+    )
+    if not syllabus:
+        syllabus = models.ClassSyllabus(
+            class_id=class_id,
+            owner_id=current_user.id,
+            text=None,
+            pdf_path=None,
+        )
+        db.add(syllabus)
+        db.commit()
+        db.refresh(syllabus)
+    return syllabus
+
+
+@app.get("/classes/{class_id}/syllabus", response_model=schemas.ClassSyllabusOut)
+def get_class_syllabus(
+    class_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    syllabus = _get_or_create_syllabus(db, current_user, class_id)
+    return syllabus
+
+
+@app.put("/classes/{class_id}/syllabus/text", response_model=schemas.ClassSyllabusOut)
+def update_class_syllabus_text(
+    class_id: int,
+    payload: schemas.ClassSyllabusTextUpdate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    syllabus = _get_or_create_syllabus(db, current_user, class_id)
+    syllabus.text = payload.text
+    db.commit()
+    db.refresh(syllabus)
+    return syllabus
+
+
+@app.post("/classes/{class_id}/syllabus/pdf", response_model=schemas.ClassSyllabusOut)
+def upload_class_syllabus_pdf(
+    class_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    if file.content_type not in ["application/pdf"]:
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed for syllabus pdf")
+
+    syllabus = _get_or_create_syllabus(db, current_user, class_id)
+
+    _ensure_syllabus_storage_dir()
+    user_dir = os.path.join(SYLLABUS_STORAGE_DIR, f"user_{current_user.id}")
+    class_dir = os.path.join(user_dir, f"class_{class_id}")
+    os.makedirs(class_dir, exist_ok=True)
+
+    if syllabus.pdf_path:
+        old_path = syllabus.pdf_path
+        try:
+            if os.path.exists(old_path):
+                os.remove(old_path)
+        except OSError:
+            pass
+
+    filename = f"syllabus_{class_id}.pdf"
+    dest_path = os.path.join(class_dir, filename)
+
+    with open(dest_path, "wb") as out_file:
+        content = file.file.read()
+        out_file.write(content)
+
+    syllabus.pdf_path = dest_path
+    db.commit()
+    db.refresh(syllabus)
+    return syllabus
+
+
+@app.delete("/classes/{class_id}/syllabus/pdf", response_model=schemas.ClassSyllabusOut)
+def delete_class_syllabus_pdf(
+    class_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    syllabus = _get_or_create_syllabus(db, current_user, class_id)
+    if syllabus.pdf_path:
+        try:
+            if os.path.exists(syllabus.pdf_path):
+                os.remove(syllabus.pdf_path)
+        except OSError:
+            pass
+        syllabus.pdf_path = None
+        db.commit()
+        db.refresh(syllabus)
+    return syllabus
+
+
+@app.post("/classes/{class_id}/syllabus/images", response_model=schemas.ClassSyllabusOut)
+def upload_class_syllabus_images(
+    class_id: int,
+    files: List[UploadFile] = File(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    allowed_types = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
+    for f in files:
+        if f.content_type not in allowed_types:
+            raise HTTPException(status_code=400, detail="Only image files are allowed for syllabus images")
+
+    syllabus = _get_or_create_syllabus(db, current_user, class_id)
+
+    _ensure_syllabus_storage_dir()
+    user_dir = os.path.join(SYLLABUS_STORAGE_DIR, f"user_{current_user.id}")
+    class_dir = os.path.join(user_dir, f"class_{class_id}")
+    images_dir = os.path.join(class_dir, "images")
+    os.makedirs(images_dir, exist_ok=True)
+
+    for f in files:
+        ext = os.path.splitext(f.filename or "")[1] or ".png"
+        filename = f"img_{datetime.utcnow().timestamp()}_{f.filename}"
+        filename = filename.replace(" ", "_")
+        dest_path = os.path.join(images_dir, filename)
+        with open(dest_path, "wb") as out_file:
+            content = f.file.read()
+            out_file.write(content)
+
+        img = models.ClassSyllabusImage(
+            file_path=dest_path,
+            syllabus_id=syllabus.id,
+        )
+        db.add(img)
+
+    db.commit()
+    db.refresh(syllabus)
+    return syllabus
+
+
+@app.delete("/classes/{class_id}/syllabus/images/{image_id}", response_model=schemas.ClassSyllabusOut)
+def delete_class_syllabus_image(
+    class_id: int,
+    image_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    syllabus = _get_or_create_syllabus(db, current_user, class_id)
+
+    img = (
+        db.query(models.ClassSyllabusImage)
+        .join(models.ClassSyllabus)
+        .filter(
+            models.ClassSyllabus.id == syllabus.id,
+            models.ClassSyllabus.owner_id == current_user.id,
+            models.ClassSyllabusImage.id == image_id,
+        )
+        .first()
+    )
+    if not img:
+        raise HTTPException(status_code=404, detail="Syllabus image not found")
+
+    try:
+        if os.path.exists(img.file_path):
+            os.remove(img.file_path)
+    except OSError:
+        pass
+
+    db.delete(img)
+    db.commit()
+    db.refresh(syllabus)
+    return syllabus
 
 
 # --- Event CRUD endpoints (per-user) ---
