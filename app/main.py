@@ -91,12 +91,37 @@ def chat(
 
     The agent is scoped to the authenticated user and can add, update, delete,
     and list events only for that user.
+    Each conversation has a UUID and messages have an increasing index per conversation.
     """
+
+    conversation: models.Conversation | None = None
+    if payload.conversation_uuid:
+        conversation = (
+            db.query(models.Conversation)
+            .filter(
+                models.Conversation.owner_id == current_user.id,
+                models.Conversation.uuid == payload.conversation_uuid,
+            )
+            .first()
+        )
+        if not conversation:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Conversation not found for this user.",
+            )
+    else:
+        conversation = models.Conversation(owner_id=current_user.id)
+        db.add(conversation)
+        db.commit()
+        db.refresh(conversation)
 
     db_history = (
         db.query(models.ChatMessage)
-        .filter(models.ChatMessage.owner_id == current_user.id)
-        .order_by(models.ChatMessage.created_at.asc())
+        .filter(
+            models.ChatMessage.owner_id == current_user.id,
+            models.ChatMessage.conversation_id == conversation.id,
+        )
+        .order_by(models.ChatMessage.message_index.asc())
         .all()
     )
 
@@ -106,11 +131,21 @@ def chat(
     if len(history_messages) > MAX_HISTORY_TURNS:
         history_messages = history_messages[-MAX_HISTORY_TURNS:]
 
+    # Next user message index for this conversation
+    next_index = 1
+    if db_history:
+        next_index = db_history[-1].message_index + 1
+
     messages_input = history_messages + [
         {"role": "user", "content": payload.message},
     ]
 
-    agent = get_calendar_agent(db=db, user_id=current_user.id)
+    agent = get_calendar_agent(
+        db=db,
+        user_id=current_user.id,
+        conversation_uuid=conversation.uuid,
+        message_index=next_index,
+    )
 
     result = agent.invoke({"messages": messages_input})
 
@@ -127,18 +162,78 @@ def chat(
     user_msg = models.ChatMessage(
         role="user",
         content=payload.message,
+        message_index=next_index,
+        conversation_id=conversation.id,
+        conversation_uuid=conversation.uuid,
         owner_id=current_user.id,
     )
     assistant_msg = models.ChatMessage(
         role="assistant",
         content=reply_text,
+        message_index=next_index + 1,
+        conversation_id=conversation.id,
+        conversation_uuid=conversation.uuid,
         owner_id=current_user.id,
     )
     db.add(user_msg)
     db.add(assistant_msg)
     db.commit()
 
-    return schemas.ChatResponse(reply=reply_text)
+    return schemas.ChatResponse(
+        reply=reply_text,
+        conversation_uuid=conversation.uuid,
+        message_index=assistant_msg.message_index,
+    )
+
+
+@app.get("/conversations", response_model=List[schemas.ConversationOut])
+def list_conversations(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    conversations = (
+        db.query(models.Conversation)
+        .filter(models.Conversation.owner_id == current_user.id)
+        .order_by(models.Conversation.created_at.desc())
+        .all()
+    )
+    return [schemas.ConversationOut(uuid=c.uuid) for c in conversations]
+
+
+@app.get("/conversations/{conversation_uuid}/messages", response_model=List[schemas.ChatMessageOut])
+def get_conversation_messages(
+    conversation_uuid: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    conversation = (
+        db.query(models.Conversation)
+        .filter(
+            models.Conversation.owner_id == current_user.id,
+            models.Conversation.uuid == conversation_uuid,
+        )
+        .first()
+    )
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    messages = (
+        db.query(models.ChatMessage)
+        .filter(
+            models.ChatMessage.owner_id == current_user.id,
+            models.ChatMessage.conversation_id == conversation.id,
+        )
+        .order_by(models.ChatMessage.message_index.asc())
+        .all()
+    )
+    return [
+        schemas.ChatMessageOut(
+            role=m.role,
+            content=m.content,
+            message_index=m.message_index,
+        )
+        for m in messages
+    ]
 
 
 # --- Class endpoints (per-user) ---
@@ -188,6 +283,79 @@ def create_class(
     return schemas.ClassOut(id=new_class.id, name=new_class.name)
 
 
+@app.patch("/classes/{class_id}", response_model=schemas.ClassOut)
+def update_class(
+    class_id: int,
+    class_in: schemas.ClassCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    cls = (
+        db.query(models.Class)
+        .filter(
+            models.Class.id == class_id,
+            models.Class.owner_id == current_user.id,
+        )
+        .first()
+    )
+    if not cls:
+        raise HTTPException(status_code=404, detail="Class not found")
+
+    existing = (
+        db.query(models.Class)
+        .filter(
+            models.Class.owner_id == current_user.id,
+            models.Class.name == class_in.name,
+            models.Class.id != class_id,
+        )
+        .first()
+    )
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Class '{class_in.name}' already exists for this user.",
+        )
+
+    old_name = cls.name
+    cls.name = class_in.name
+    db.commit()
+
+    db.query(models.Event).filter(
+        models.Event.owner_id == current_user.id,
+        models.Event.class_name == old_name,
+    ).update({models.Event.class_name: class_in.name})
+    db.commit()
+
+    return schemas.ClassOut(id=cls.id, name=cls.name)
+
+
+@app.delete("/classes/{class_id}")
+def delete_class(
+    class_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    cls = (
+        db.query(models.Class)
+        .filter(
+            models.Class.id == class_id,
+            models.Class.owner_id == current_user.id,
+        )
+        .first()
+    )
+    if not cls:
+        raise HTTPException(status_code=404, detail="Class not found")
+
+    db.query(models.Event).filter(
+        models.Event.owner_id == current_user.id,
+        models.Event.class_name == cls.name,
+    ).delete(synchronize_session=False)
+    db.delete(cls)
+    db.commit()
+
+    return {"detail": "Class and related events deleted"}
+
+
 # --- Event CRUD endpoints (per-user) ---
 
 
@@ -224,8 +392,7 @@ def create_event(
 
     event = models.Event(
         title=event_in.title,
-        start=due,
-        end=due,
+        due=due,
         location=event_in.location,
         description=event_in.description,
         assignment_type=event_in.assignment_type,
@@ -241,7 +408,7 @@ def create_event(
     return schemas.EventOut(
         id=event.id,
         title=event.title,
-        due=event.start,
+        due=event.due,
         location=event.location,
         description=event.description,
         assignment_type=event.assignment_type,
@@ -261,13 +428,13 @@ def list_events(
     if date_filter is not None:
         start_dt = datetime.combine(date_filter, datetime.min.time())
         end_dt = datetime.combine(date_filter, datetime.max.time())
-        q = q.filter(models.Event.start.between(start_dt, end_dt))
-    events = q.order_by(models.Event.start.asc()).all()
+        q = q.filter(models.Event.due.between(start_dt, end_dt))
+    events = q.order_by(models.Event.due.asc()).all()
     return [
         schemas.EventOut(
             id=e.id,
             title=e.title,
-            due=e.start,
+            due=e.due,
             location=e.location,
             description=e.description,
             assignment_type=e.assignment_type,
@@ -295,7 +462,7 @@ def get_event(
     return schemas.EventOut(
         id=event.id,
         title=event.title,
-        due=event.start,
+        due=event.due,
         location=event.location,
         description=event.description,
         assignment_type=event.assignment_type,
@@ -323,8 +490,7 @@ def update_event(
     if event_in.title is not None:
         event.title = event_in.title
     if event_in.due is not None:
-        event.start = event_in.due
-        event.end = event_in.due
+        event.due = event_in.due
     if event_in.location is not None:
         event.location = event_in.location
     if event_in.description is not None:
@@ -352,7 +518,7 @@ def update_event(
     return schemas.EventOut(
         id=event.id,
         title=event.title,
-        due=event.start,
+        due=event.due,
         location=event.location,
         description=event.description,
         assignment_type=event.assignment_type,

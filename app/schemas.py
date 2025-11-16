@@ -72,7 +72,23 @@ class EventOut(EventBase):
 
 class ChatRequest(BaseModel):
     message: str
+    conversation_uuid: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
     reply: str
+    conversation_uuid: str
+    message_index: int
+
+
+class ConversationOut(BaseModel):
+    uuid: str
+
+
+class ChatMessageOut(BaseModel):
+    role: str
+    content: str
+    message_index: int
+
+    class Config:
+        orm_mode = True

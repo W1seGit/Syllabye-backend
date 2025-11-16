@@ -19,8 +19,7 @@ def db_create_event(
     user_id: int,
     *,
     title: str,
-    start: datetime,
-    end: datetime,
+    due: datetime,
     location: str | None = None,
     description: str | None = None,
     assignment_type: str | None = None,
@@ -30,8 +29,7 @@ def db_create_event(
 ) -> str:
     event = models.Event(
         title=title,
-        start=start,
-        end=end,
+        due=due,
         location=location,
         description=description,
         assignment_type=assignment_type,
@@ -43,7 +41,7 @@ def db_create_event(
     db.add(event)
     db.commit()
     db.refresh(event)
-    return f"Created event id={event.id} titled '{event.title}' starting {event.start}"
+    return f"Created event id={event.id} titled '{event.title}' due {event.due}"
 
 
 def db_update_event(
@@ -52,8 +50,7 @@ def db_update_event(
     *,
     event_id: int,
     title: str | None = None,
-    start: datetime | None = None,
-    end: datetime | None = None,
+    due: datetime | None = None,
     location: str | None = None,
     description: str | None = None,
     assignment_type: str | None = None,
@@ -71,10 +68,8 @@ def db_update_event(
 
     if title is not None:
         event.title = title
-    if start is not None:
-        event.start = start
-    if end is not None:
-        event.end = end
+    if due is not None:
+        event.due = due
     if location is not None:
         event.location = location
     if description is not None:
@@ -116,18 +111,29 @@ def db_list_events(
     q = db.query(models.Event).filter(models.Event.owner_id == user_id)
     if date is not None:
         # Filter by same calendar date
-        q = q.filter(models.Event.start.between(date.replace(hour=0, minute=0, second=0, microsecond=0),
-                                               date.replace(hour=23, minute=59, second=59, microsecond=999999)))
+        q = q.filter(models.Event.due.between(
+            date.replace(hour=0, minute=0, second=0, microsecond=0),
+            date.replace(hour=23, minute=59, second=59, microsecond=999999),
+        ))
     if title_query:
         q = q.filter(models.Event.title.ilike(f"%{title_query}%"))
-    return q.order_by(models.Event.start.asc()).all()
+    return q.order_by(models.Event.due.asc()).all()
 
 
 # --- Tool factory ---
 
 
-def make_calendar_tools(db: Session, user_id: int):
-    """Create per-user tools so the LLM can never access other users' events."""
+def make_calendar_tools(
+    db: Session,
+    user_id: int,
+    conversation_uuid: str | None = None,
+    message_index: int | None = None,
+):
+    """Create per-user tools so the LLM can never access other users' events.
+
+    conversation_uuid and message_index (if provided) will be attached to tool call logs
+    so that tool executions can be tied back to a specific user message.
+    """
 
     def _ensure_default_class_name() -> str:
         default_class = (
@@ -160,6 +166,8 @@ def make_calendar_tools(db: Session, user_id: int):
             tool_name=tool_name,
             arguments=json.dumps(arguments, default=str),
             result=result,
+            conversation_uuid=conversation_uuid,
+            message_index=message_index,
             owner_id=user_id,
         )
         db.add(log)
@@ -175,8 +183,12 @@ def make_calendar_tools(db: Session, user_id: int):
             .all()
         )
         if not classes:
-            return "No classes found for this user."
-        return "\n".join(f"id={c.id} | {c.name}" for c in classes)
+            result = "No classes found for this user."
+            _log_tool_call("list_classes", {}, result)
+            return result
+        result = "\n".join(f"id={c.id} | {c.name}" for c in classes)
+        _log_tool_call("list_classes", {}, result)
+        return result
 
     def create_class_tool(name: str) -> str:
         """Create a new class for this user (e.g. "Math", "Biology").
@@ -190,12 +202,94 @@ def make_calendar_tools(db: Session, user_id: int):
             .first()
         )
         if existing:
-            return f"Class '{name}' already exists."
+            result = f"Class '{name}' already exists."
+            _log_tool_call("create_class", {"name": name}, result)
+            return result
         new_class = models.Class(name=name, owner_id=user_id)
         db.add(new_class)
         db.commit()
         db.refresh(new_class)
-        return f"Created class id={new_class.id} name='{new_class.name}'"
+        result = f"Created class id={new_class.id} name='{new_class.name}'"
+        _log_tool_call("create_class", {"name": name}, result)
+        return result
+
+    def rename_class_tool(old_name: str, new_name: str) -> str:
+        """Rename an existing class for this user and update all events that use it.
+
+        Use this when the subject name changes (e.g. "Algebra" to "Math").
+        """
+
+        cls = (
+            db.query(models.Class)
+            .filter(models.Class.owner_id == user_id, models.Class.name == old_name)
+            .first()
+        )
+        if not cls:
+            result = f"Class '{old_name}' does not exist for this user."
+            _log_tool_call(
+                "rename_class",
+                {"old_name": old_name, "new_name": new_name},
+                result,
+            )
+            return result
+
+        existing_new = (
+            db.query(models.Class)
+            .filter(models.Class.owner_id == user_id, models.Class.name == new_name)
+            .first()
+        )
+        if existing_new:
+            result = f"Class '{new_name}' already exists for this user."
+            _log_tool_call(
+                "rename_class",
+                {"old_name": old_name, "new_name": new_name},
+                result,
+            )
+            return result
+
+        cls.name = new_name
+        db.commit()
+
+        db.query(models.Event).filter(
+            models.Event.owner_id == user_id,
+            models.Event.class_name == old_name,
+        ).update({models.Event.class_name: new_name})
+        db.commit()
+
+        result = f"Renamed class '{old_name}' to '{new_name}' and updated related events."
+        _log_tool_call(
+            "rename_class",
+            {"old_name": old_name, "new_name": new_name},
+            result,
+        )
+        return result
+
+    def delete_class_tool(name: str) -> str:
+        """Delete a class for this user and all events that belong to that class.
+
+        Use with care. This will permanently remove associated events.
+        """
+
+        cls = (
+            db.query(models.Class)
+            .filter(models.Class.owner_id == user_id, models.Class.name == name)
+            .first()
+        )
+        if not cls:
+            result = f"Class '{name}' does not exist for this user."
+            _log_tool_call("delete_class", {"name": name}, result)
+            return result
+
+        db.query(models.Event).filter(
+            models.Event.owner_id == user_id,
+            models.Event.class_name == name,
+        ).delete(synchronize_session=False)
+        db.delete(cls)
+        db.commit()
+
+        result = f"Deleted class '{name}' and all related events."
+        _log_tool_call("delete_class", {"name": name}, result)
+        return result
 
     def create_event_tool(
         title: str,
@@ -216,9 +310,6 @@ def make_calendar_tools(db: Session, user_id: int):
         """
 
         due = datetime.fromisoformat(due_iso)
-        start = due
-        end = due
-
         validated_class = _validate_class_name(class_name)
         if validated_class == "INVALID_CLASS":
             msg = (
@@ -249,8 +340,7 @@ def make_calendar_tools(db: Session, user_id: int):
             db,
             user_id,
             title=title,
-            start=start,
-            end=end,
+            due=due,
             location=location,
             description=description,
             assignment_type=assignment_type,
@@ -295,11 +385,8 @@ def make_calendar_tools(db: Session, user_id: int):
 
         if due_iso:
             due = datetime.fromisoformat(due_iso)
-            start = due
-            end = due
         else:
-            start = None
-            end = None
+            due = None
 
         validated_class: str | None
         if class_name is not None:
@@ -334,8 +421,7 @@ def make_calendar_tools(db: Session, user_id: int):
             user_id,
             event_id=event_id,
             title=title,
-            start=start,
-            end=end,
+            due=due,
             location=location,
             description=description,
             assignment_type=assignment_type,
@@ -407,7 +493,7 @@ def make_calendar_tools(db: Session, user_id: int):
         lines = []
         for e in events:
             lines.append(
-                f"id={e.id} | {e.title} | {e.start.isoformat()} - {e.end.isoformat()} | {e.location or ''}"
+                f"id={e.id} | {e.title} | {e.due.isoformat()} | {e.location or ''}"
             )
         result = "\n".join(lines)
         _log_tool_call(
@@ -426,6 +512,16 @@ def make_calendar_tools(db: Session, user_id: int):
         func=create_class_tool,
         name="create_class",
         description=create_class_tool.__doc__ or "Create a class.",
+    )
+    rename_class = StructuredTool.from_function(
+        func=rename_class_tool,
+        name="rename_class",
+        description=rename_class_tool.__doc__ or "Rename a class.",
+    )
+    delete_class = StructuredTool.from_function(
+        func=delete_class_tool,
+        name="delete_class",
+        description=delete_class_tool.__doc__ or "Delete a class.",
     )
     create_event = StructuredTool.from_function(
         func=create_event_tool,
@@ -448,16 +544,35 @@ def make_calendar_tools(db: Session, user_id: int):
         description=list_events_tool.__doc__ or "List events.",
     )
 
-    return [list_classes, create_class, create_event, update_event, delete_event, list_events]
+    return [
+        list_classes,
+        create_class,
+        rename_class,
+        delete_class,
+        create_event,
+        update_event,
+        delete_event,
+        list_events,
+    ]
 
 
 # --- Agent factory ---
 
 
-def get_calendar_agent(db: Session, user_id: int):
-    llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0)
+def get_calendar_agent(
+    db: Session,
+    user_id: int,
+    conversation_uuid: str | None = None,
+    message_index: int | None = None,
+):
+    llm = ChatOpenAI(model="gpt-5-mini", temperature=0)
 
-    tools = make_calendar_tools(db, user_id)
+    tools = make_calendar_tools(
+        db,
+        user_id,
+        conversation_uuid=conversation_uuid,
+        message_index=message_index,
+    )
 
     now_iso = datetime.now().isoformat()
 
@@ -474,6 +589,7 @@ def get_calendar_agent(db: Session, user_id: int):
         "Use list_events to inspect events (and show IDs) before updating or deleting them. "
         "Classes: every task must belong to a valid class for the user. The default class name is 'Default'. "
         "Use list_classes to see existing classes, create_class to add new ones (e.g., 'Math'), "
+        "rename_class to rename them, delete_class to remove them (and their events), "
         "and only then assign class_name when creating or updating events. "
     )
 

@@ -1,6 +1,7 @@
 from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey
 from sqlalchemy.orm import relationship
 from datetime import datetime
+import uuid
 
 from .database import Base
 
@@ -16,6 +17,7 @@ class User(Base):
     classes = relationship("Class", back_populates="owner", cascade="all, delete-orphan")
     chat_messages = relationship("ChatMessage", back_populates="owner", cascade="all, delete-orphan")
     tool_calls = relationship("ToolCallLog", back_populates="owner", cascade="all, delete-orphan")
+    conversations = relationship("Conversation", back_populates="owner", cascade="all, delete-orphan")
 
 
 class Class(Base):
@@ -36,8 +38,7 @@ class Event(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String, nullable=False)
-    start = Column(DateTime, nullable=False)
-    end = Column(DateTime, nullable=False)
+    due = Column(DateTime, nullable=False)
     location = Column(String, nullable=True)
     description = Column(Text, nullable=True)
     assignment_type = Column(String, nullable=True)
@@ -52,12 +53,31 @@ class Event(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
 
+class Conversation(Base):
+    __tablename__ = "conversations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    uuid = Column(String, unique=True, index=True, default=lambda: str(uuid.uuid4()), nullable=False)
+
+    owner_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    owner = relationship("User", back_populates="conversations")
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    messages = relationship("ChatMessage", back_populates="conversation", cascade="all, delete-orphan")
+
+
 class ChatMessage(Base):
     __tablename__ = "chat_messages"
 
     id = Column(Integer, primary_key=True, index=True)
     role = Column(String, nullable=False)
     content = Column(Text, nullable=False)
+    message_index = Column(Integer, nullable=False)
+
+    conversation_id = Column(Integer, ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True)
+    conversation = relationship("Conversation", back_populates="messages")
+    conversation_uuid = Column(String, nullable=False, index=True)
 
     owner_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     owner = relationship("User", back_populates="chat_messages")
@@ -72,6 +92,9 @@ class ToolCallLog(Base):
     tool_name = Column(String, nullable=False)
     arguments = Column(Text, nullable=True)
     result = Column(Text, nullable=True)
+
+    conversation_uuid = Column(String, nullable=True, index=True)
+    message_index = Column(Integer, nullable=True)
 
     owner_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     owner = relationship("User", back_populates="tool_calls")
