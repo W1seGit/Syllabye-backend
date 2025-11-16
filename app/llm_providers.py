@@ -29,7 +29,7 @@ ProviderName = Literal["openai", "groq"]
 
 # Single place to configure which provider/model is active for the agents.
 # Flip "active_provider" or adjust the model names as needed.
-active_provider: ProviderName = "groq"
+active_provider: ProviderName = "openai"
 
 provider_models = {
     "openai": {
