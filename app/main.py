@@ -197,7 +197,10 @@ def list_conversations(
         .order_by(models.Conversation.created_at.desc())
         .all()
     )
-    return [schemas.ConversationOut(uuid=c.uuid) for c in conversations]
+    return [
+        schemas.ConversationOut(uuid=c.uuid, name=c.name)
+        for c in conversations
+    ]
 
 
 @app.get("/conversations/{conversation_uuid}/messages", response_model=List[schemas.ChatMessageOut])
@@ -234,6 +237,31 @@ def get_conversation_messages(
         )
         for m in messages
     ]
+
+
+@app.patch("/conversations/{conversation_uuid}", response_model=schemas.ConversationOut)
+def update_conversation_name(
+    conversation_uuid: str,
+    name: str,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    conversation = (
+        db.query(models.Conversation)
+        .filter(
+            models.Conversation.owner_id == current_user.id,
+            models.Conversation.uuid == conversation_uuid,
+        )
+        .first()
+    )
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    conversation.name = name or "New Chat"
+    db.commit()
+    db.refresh(conversation)
+
+    return schemas.ConversationOut(uuid=conversation.uuid, name=conversation.name)
 
 
 # --- Class endpoints (per-user) ---

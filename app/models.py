@@ -58,6 +58,7 @@ class Conversation(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     uuid = Column(String, unique=True, index=True, default=lambda: str(uuid.uuid4()), nullable=False)
+    name = Column(String, nullable=False, default="New Chat")
 
     owner_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     owner = relationship("User", back_populates="conversations")

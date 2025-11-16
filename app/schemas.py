@@ -83,6 +83,7 @@ class ChatResponse(BaseModel):
 
 class ConversationOut(BaseModel):
     uuid: str
+    name: str
 
 
 class ChatMessageOut(BaseModel):
