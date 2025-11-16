@@ -1,22 +1,34 @@
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base
 import os
+from typing import Generator
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./app.db")
-
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
-)
-
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-Base = declarative_base()
+from dotenv import load_dotenv
+from pymongo import MongoClient, ReturnDocument
+from pymongo.database import Database
 
 
-def get_db():
-    db = SessionLocal()
+load_dotenv()
+
+MONGODB_URI = os.getenv("MONGODB_URI") or os.getenv("DATABASE_URL", "mongodb://localhost:27017")
+MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "syllabye")
+
+_client = MongoClient(MONGODB_URI)
+_db: Database = _client[MONGODB_DB_NAME]
+
+
+def get_db() -> Generator[Database, None, None]:
     try:
-        yield db
+        yield _db
     finally:
-        db.close()
+        # No explicit close per-request; client is process-wide.
+        pass
+
+
+def get_next_id(collection_name: str) -> int:
+    counters = _db["counters"]
+    doc = counters.find_one_and_update(
+        {"_id": collection_name},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return int(doc["seq"])

@@ -1,13 +1,14 @@
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Dict, Optional, cast
 import json
 
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 
 from langchain.agents import create_agent
 from langchain_core.tools import StructuredTool
 
 from . import models
+from .database import get_next_id
 from .llm_providers import get_llm
 
 
@@ -15,7 +16,7 @@ from .llm_providers import get_llm
 
 
 def db_create_event(
-    db: Session,
+    db: Database,
     user_id: int,
     *,
     title: str,
@@ -27,25 +28,30 @@ def db_create_event(
     status: str | None = None,
     priority: str | None = None,
 ) -> str:
-    event = models.Event(
-        title=title,
-        due=due,
-        location=location,
-        description=description,
-        assignment_type=assignment_type,
-        class_name=class_name,
-        status=status,
-        priority=priority,
-        owner_id=user_id,
-    )
-    db.add(event)
-    db.commit()
-    db.refresh(event)
-    return f"Created event id={event.id} titled '{event.title}' due {event.due}"
+    events = db["events"]
+    event_id = get_next_id("events")
+    now = datetime.utcnow()
+    event: models.Event = {
+        "_id": event_id,
+        "id": event_id,
+        "title": title,
+        "due": due,
+        "location": location,
+        "description": description,
+        "assignment_type": assignment_type,
+        "class_name": class_name,
+        "status": status,
+        "priority": priority,
+        "owner_id": user_id,
+        "created_at": now,
+        "updated_at": now,
+    }
+    events.insert_one(event)
+    return f"Created event id={event_id} titled '{title}' due {due}"
 
 
 def db_update_event(
-    db: Session,
+    db: Database,
     user_id: int,
     *,
     event_id: int,
@@ -58,135 +64,134 @@ def db_update_event(
     status: str | None = None,
     priority: str | None = None,
 ) -> str:
-    event = (
-        db.query(models.Event)
-        .filter(models.Event.id == event_id, models.Event.owner_id == user_id)
-        .first()
-    )
+    events = db["events"]
+    event = events.find_one({"id": event_id, "owner_id": user_id})
     if not event:
         return "Event not found for this user."
 
+    update_fields: Dict[str, object] = {}
     if title is not None:
-        event.title = title
+        update_fields["title"] = title
     if due is not None:
-        event.due = due
+        update_fields["due"] = due
     if location is not None:
-        event.location = location
+        update_fields["location"] = location
     if description is not None:
-        event.description = description
+        update_fields["description"] = description
     if assignment_type is not None:
-        event.assignment_type = assignment_type
+        update_fields["assignment_type"] = assignment_type
     if class_name is not None:
-        event.class_name = class_name
+        update_fields["class_name"] = class_name
     if status is not None:
-        event.status = status
+        update_fields["status"] = status
     if priority is not None:
-        event.priority = priority
+        update_fields["priority"] = priority
 
-    db.commit()
-    db.refresh(event)
-    return f"Updated event id={event.id} titled '{event.title}'"
+    if update_fields:
+        update_fields["updated_at"] = datetime.utcnow()
+        events.update_one({"_id": event["_id"]}, {"$set": update_fields})
+        event.update(update_fields)
+
+    return f"Updated event id={event_id} titled '{event.get('title', title or '')}'"
 
 
-def db_delete_event(db: Session, user_id: int, *, event_id: int) -> str:
-    event = (
-        db.query(models.Event)
-        .filter(models.Event.id == event_id, models.Event.owner_id == user_id)
-        .first()
-    )
+def db_delete_event(db: Database, user_id: int, *, event_id: int) -> str:
+    events = db["events"]
+    event = events.find_one({"id": event_id, "owner_id": user_id})
     if not event:
         return "Event not found for this user."
-    db.delete(event)
-    db.commit()
+    events.delete_one({"_id": event["_id"]})
     return f"Deleted event id={event_id}"
 
 
 def db_list_events(
-    db: Session,
+    db: Database,
     user_id: int,
     *,
     date: datetime | None = None,
     title_query: str | None = None,
 ) -> List[models.Event]:
-    q = db.query(models.Event).filter(models.Event.owner_id == user_id)
+    query: Dict[str, object] = {"owner_id": user_id}
     if date is not None:
-        # Filter by same calendar date
-        q = q.filter(models.Event.due.between(
-            date.replace(hour=0, minute=0, second=0, microsecond=0),
-            date.replace(hour=23, minute=59, second=59, microsecond=999999),
-        ))
+        query["due"] = {
+            "$gte": date.replace(hour=0, minute=0, second=0, microsecond=0),
+            "$lte": date.replace(hour=23, minute=59, second=59, microsecond=999999),
+        }
     if title_query:
-        q = q.filter(models.Event.title.ilike(f"%{title_query}%"))
-    return q.order_by(models.Event.due.asc()).all()
+        query["title"] = {"$regex": title_query, "$options": "i"}
+
+    events = db["events"].find(query).sort("due", 1)
+    return [cast(models.Event, e) for e in events]
 
 
 # --- Tool factory ---
 
 
 def make_calendar_tools(
-    db: Session,
+    db: Database,
     user_id: int,
     conversation_uuid: str | None = None,
     message_index: int | None = None,
 ):
     """Create per-user tools so the LLM can never access other users' events.
 
-    conversation_uuid and message_index (if provided) will be attached to tool call logs
-    so that tool executions can be tied back to a specific user message.
+    Backed by MongoDB collections; conversation_uuid and message_index (if provided)
+    are attached to tool call logs.
     """
 
+    classes_col = db["classes"]
+    events_col = db["events"]
+    logs_col = db["tool_call_logs"]
+
     def _ensure_default_class_name() -> str:
-        default_class = (
-            db.query(models.Class)
-            .filter(models.Class.owner_id == user_id, models.Class.name == "Default")
-            .first()
-        )
+        default_class = classes_col.find_one({"owner_id": user_id, "name": "Default"})
         if not default_class:
-            default_class = models.Class(name="Default", owner_id=user_id)
-            db.add(default_class)
-            db.commit()
+            class_id = get_next_id("classes")
+            now = datetime.utcnow()
+            cls: models.Class = {
+                "_id": class_id,
+                "id": class_id,
+                "name": "Default",
+                "owner_id": user_id,
+                "created_at": now,
+                "updated_at": now,
+            }
+            classes_col.insert_one(cls)
         return "Default"
 
     def _validate_class_name(name: str | None) -> str:
         if name is None:
             return _ensure_default_class_name()
-        existing = (
-            db.query(models.Class)
-            .filter(models.Class.owner_id == user_id, models.Class.name == name)
-            .first()
-        )
+        existing = classes_col.find_one({"owner_id": user_id, "name": name})
         if not existing:
-            return (
-                "INVALID_CLASS"
-            )
+            return "INVALID_CLASS"
         return name
 
     def _log_tool_call(tool_name: str, arguments: dict, result: str) -> None:
-        log = models.ToolCallLog(
-            tool_name=tool_name,
-            arguments=json.dumps(arguments, default=str),
-            result=result,
-            conversation_uuid=conversation_uuid,
-            message_index=message_index,
-            owner_id=user_id,
-        )
-        db.add(log)
-        db.commit()
+        log_id = get_next_id("tool_call_logs")
+        now = datetime.utcnow()
+        log: models.ToolCallLog = {
+            "_id": log_id,
+            "id": log_id,
+            "tool_name": tool_name,
+            "arguments": json.dumps(arguments, default=str),
+            "result": result,
+            "conversation_uuid": conversation_uuid,
+            "message_index": message_index,
+            "owner_id": user_id,
+            "created_at": now,
+        }
+        logs_col.insert_one(log)
 
     def list_classes_tool() -> str:
         """List the user's classes by name. Use this before assigning a class_name to a task."""
 
-        classes = (
-            db.query(models.Class)
-            .filter(models.Class.owner_id == user_id)
-            .order_by(models.Class.name.asc())
-            .all()
-        )
+        classes = list(classes_col.find({"owner_id": user_id}).sort("name", 1))
         if not classes:
             result = "No classes found for this user."
             _log_tool_call("list_classes", {}, result)
             return result
-        result = "\n".join(f"id={c.id} | {c.name}" for c in classes)
+        result = "\n".join(f"id={c['id']} | {c['name']}" for c in classes)
         _log_tool_call("list_classes", {}, result)
         return result
 
@@ -196,20 +201,24 @@ def make_calendar_tools(
         Use this if you need a class that does not yet exist before creating a task.
         """
 
-        existing = (
-            db.query(models.Class)
-            .filter(models.Class.owner_id == user_id, models.Class.name == name)
-            .first()
-        )
+        existing = classes_col.find_one({"owner_id": user_id, "name": name})
         if existing:
             result = f"Class '{name}' already exists."
             _log_tool_call("create_class", {"name": name}, result)
             return result
-        new_class = models.Class(name=name, owner_id=user_id)
-        db.add(new_class)
-        db.commit()
-        db.refresh(new_class)
-        result = f"Created class id={new_class.id} name='{new_class.name}'"
+
+        class_id = get_next_id("classes")
+        now = datetime.utcnow()
+        new_class: models.Class = {
+            "_id": class_id,
+            "id": class_id,
+            "name": name,
+            "owner_id": user_id,
+            "created_at": now,
+            "updated_at": now,
+        }
+        classes_col.insert_one(new_class)
+        result = f"Created class id={class_id} name='{name}'"
         _log_tool_call("create_class", {"name": name}, result)
         return result
 
@@ -219,11 +228,7 @@ def make_calendar_tools(
         Use this when the subject name changes (e.g. "Algebra" to "Math").
         """
 
-        cls = (
-            db.query(models.Class)
-            .filter(models.Class.owner_id == user_id, models.Class.name == old_name)
-            .first()
-        )
+        cls = classes_col.find_one({"owner_id": user_id, "name": old_name})
         if not cls:
             result = f"Class '{old_name}' does not exist for this user."
             _log_tool_call(
@@ -233,11 +238,7 @@ def make_calendar_tools(
             )
             return result
 
-        existing_new = (
-            db.query(models.Class)
-            .filter(models.Class.owner_id == user_id, models.Class.name == new_name)
-            .first()
-        )
+        existing_new = classes_col.find_one({"owner_id": user_id, "name": new_name})
         if existing_new:
             result = f"Class '{new_name}' already exists for this user."
             _log_tool_call(
@@ -247,14 +248,14 @@ def make_calendar_tools(
             )
             return result
 
-        cls.name = new_name
-        db.commit()
-
-        db.query(models.Event).filter(
-            models.Event.owner_id == user_id,
-            models.Event.class_name == old_name,
-        ).update({models.Event.class_name: new_name})
-        db.commit()
+        classes_col.update_one(
+            {"_id": cls["_id"]},
+            {"$set": {"name": new_name, "updated_at": datetime.utcnow()}},
+        )
+        events_col.update_many(
+            {"owner_id": user_id, "class_name": old_name},
+            {"$set": {"class_name": new_name}},
+        )
 
         result = f"Renamed class '{old_name}' to '{new_name}' and updated related events."
         _log_tool_call(
@@ -270,22 +271,14 @@ def make_calendar_tools(
         Use with care. This will permanently remove associated events.
         """
 
-        cls = (
-            db.query(models.Class)
-            .filter(models.Class.owner_id == user_id, models.Class.name == name)
-            .first()
-        )
+        cls = classes_col.find_one({"owner_id": user_id, "name": name})
         if not cls:
             result = f"Class '{name}' does not exist for this user."
             _log_tool_call("delete_class", {"name": name}, result)
             return result
 
-        db.query(models.Event).filter(
-            models.Event.owner_id == user_id,
-            models.Event.class_name == name,
-        ).delete(synchronize_session=False)
-        db.delete(cls)
-        db.commit()
+        events_col.delete_many({"owner_id": user_id, "class_name": name})
+        classes_col.delete_one({"_id": cls["_id"]})
 
         result = f"Deleted class '{name}' and all related events."
         _log_tool_call("delete_class", {"name": name}, result)
@@ -490,20 +483,55 @@ def make_calendar_tools(
         """
 
         date: datetime | None = None
+        events: List[models.Event]
         if date_iso:
             lower = date_iso.strip().lower()
-            try:
-                if lower == "today":
-                    date = datetime.now()
-                elif lower == "tomorrow":
-                    date = datetime.now() + timedelta(days=1)
-                else:
-                    # Try strict ISO format; if it fails, fall back to no date filter.
-                    date = datetime.fromisoformat(date_iso)
-            except ValueError:
-                # If the date can't be parsed, ignore the date filter and still list events.
-                date = None
-        events = db_list_events(db, user_id, date=date, title_query=title_query)
+            now = datetime.now()
+            # Handle common relative phrases like "this week" and "next week".
+            if lower in {"this week", "thisweek", "this_week"}:
+                # Start of the current week (Monday 00:00)
+                week_start = now - timedelta(days=now.weekday())
+                week_start = week_start.replace(hour=0, minute=0, second=0, microsecond=0)
+                week_end = week_start + timedelta(days=7)
+                week_end = week_end.replace(hour=23, minute=59, second=59, microsecond=999999)
+                query: Dict[str, object] = {
+                    "owner_id": user_id,
+                    "due": {"$gte": week_start, "$lte": week_end},
+                }
+                cursor = events_col.find(query).sort("due", 1)
+                events = [cast(models.Event, e) for e in cursor]
+            elif lower in {"next week", "nextweek", "next_week"}:
+                # Start of next week (Monday 00:00 of the following week)
+                this_week_start = now - timedelta(days=now.weekday())
+                next_week_start = this_week_start + timedelta(days=7)
+                next_week_start = next_week_start.replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
+                next_week_end = next_week_start + timedelta(days=7)
+                next_week_end = next_week_end.replace(
+                    hour=23, minute=59, second=59, microsecond=999999
+                )
+                query = {
+                    "owner_id": user_id,
+                    "due": {"$gte": next_week_start, "$lte": next_week_end},
+                }
+                cursor = events_col.find(query).sort("due", 1)
+                events = [cast(models.Event, e) for e in cursor]
+            else:
+                try:
+                    if lower == "today":
+                        date = now
+                    elif lower == "tomorrow":
+                        date = now + timedelta(days=1)
+                    else:
+                        # Try strict ISO format; if it fails, fall back to no date filter.
+                        date = datetime.fromisoformat(date_iso)
+                except ValueError:
+                    # If the date can't be parsed, ignore the date filter and still list events.
+                    date = None
+                events = db_list_events(db, user_id, date=date, title_query=title_query)
+        else:
+            events = db_list_events(db, user_id, date=None, title_query=title_query)
         if not events:
             result = "No events found."
             _log_tool_call(
@@ -515,7 +543,7 @@ def make_calendar_tools(
         lines = []
         for e in events:
             lines.append(
-                f"id={e.id} | {e.title} | {e.due.isoformat()} | {e.location or ''}"
+                f"id={e['id']} | {e['title']} | {e['due'].isoformat()} | {e.get('location') or ''}"
             )
         result = "\n".join(lines)
         _log_tool_call(
@@ -582,7 +610,7 @@ def make_calendar_tools(
 
 
 def get_calendar_agent(
-    db: Session,
+    db: Database,
     user_id: int,
     conversation_uuid: str | None = None,
     message_index: int | None = None,
@@ -599,73 +627,103 @@ def get_calendar_agent(
     now_iso = datetime.now().isoformat()
 
     system_prompt = f"""Current datetime (ISO): {now_iso}.
-You are a warm, calming, and helpful school-task assistant. 
+You are a warm, calming, and helpful school-task assistant.
 You manage tasks only for the currently authenticated user.
 
 OVERALL STYLE
 - Keep the tone friendly, relaxed, and reassuring—not formal or robotic.
 - Be concise but supportive, like a helpful classmate who’s good at organizing.
 
-TASK CREATION FLOW (VERY IMPORTANT)
-1. If the user gives a task but does NOT give a title, ask ONLY for the title first.
-   (Example: If they say “I have homework due tomorrow,” ask: 
-    “Got it—what would you like to call this task?”)
+GENERAL PRINCIPLES
+- Default to TAKING ACTION instead of asking lots of questions.
+- If you have enough information to create or update a task, just do it.
+- Only ask short, focused follow‑ups when something important is unclear.
+- You may suggest optional improvements AFTER creating a task (e.g. ask if they
+  want to add a description or adjust priority), but never block creation on
+  purely optional details.
 
-2. After you have a title, then gather ONLY the details that are missing:
-   - due date/time (if unclear)
-   - class
-   - assignment type
-   - priority (only if the user wants one)
-   - description (optional, but ask gently if it might help)
+TASK CREATION (VERY IMPORTANT)
+- The user often just wants the task created quickly.
+- When they describe a task ("I have a conference at 4pm on Wednesday" or
+  "I have math homework due tomorrow"), you should:
+  1) Infer a clear, natural title yourself.
+  2) Infer the class when it is obvious from context.
+  3) Infer a reasonable status and priority.
+  4) Create the task with sensible defaults.
 
-3. Never ask for all missing info at once. 
-   Ask in the simplest, smallest steps needed to keep things flowing.
-
-4. If the user gives enough info to create the task already, don’t ask extra questions.
+When to ASK for a title
+- Only ask the user to name the task if:
+  - The request is extremely vague (no clear action), OR
+  - The user explicitly says they want to choose the title.
+- Otherwise, YOU create the title.
 
 TITLES (HUMAN-FRIENDLY SENTENCES)
-- Always create titles in a natural “to-do” style:
-  “Finish essay for English”
-  “Study for the biology quiz”
-  “Complete homework 5 for Math”
+- Always create titles in a natural "to-do" style, using the user’s words
+  where helpful:
+  - "Attend conference with Bank of America"
+  - "Finish essay for English"
+  - "Study for the biology quiz"
+  - "Complete homework 5 for Math"
 - Action first, class second.
 - Friendly, simple, and readable.
 
-DESCRIPTIONS
-- Add meaningful details that help them actually do the task:
-  - instructions or deliverables
-  - length/format
-  - materials needed
-  - a few bullet points if helpful
-- Do NOT restate the title.
-
 CLASSES
 - Every task needs one class.
-- Use list_classes to see what exists.
-- Create a class if needed (only after the user confirms).
-- Never assign a class that doesn't exist yet.
+- If the user clearly indicates the subject, ASSIGN THAT CLASS without asking:
+  - "math homework" → use the Math class if it exists.
+  - "biology quiz" → use the Biology class if it exists.
+- Use list_classes only when you truly need to see what exists.
+- Ask which class to use ONLY when it is genuinely ambiguous and cannot be
+  safely inferred.
+- You may create a new class if the user clearly wants one with that name, or
+  explicitly agrees.
 
 ASSIGNMENT TYPES
-- Normalize to: Homework, Reading, Lab, Project, Paper, Quiz, Exam, Presentation, etc.
+- Normalize to: Homework, Reading, Lab, Project, Paper, Quiz, Exam,
+  Presentation, etc., when appropriate.
 
 PRIORITY
-- Set only if given by the user or clearly implied.
-- High → exams, big projects, next-day deadlines.
-- Medium → normal assignments.
-- Low → long-term or casual work.
+- If the user explicitly gives a priority or urgency, respect it.
+- Otherwise, infer a reasonable default:
+  - High → exams, big projects, next-day deadlines, very urgent language.
+  - Medium → normal assignments.
+  - Low → long-term or casual work.
+- Do NOT ask for priority before creating the task. Create the task first, then
+  you may briefly ask if they want to adjust it.
+
+DESCRIPTION
+- Descriptions are optional. Do NOT block task creation on description.
+- After creating a task, you may gently ask if they want to add helpful details
+  (instructions, materials, etc.).
 
 DUE DATE & TIME
 - Tasks always need a due date.
-- If the user gives only a date, default to 11:59 PM unless context suggests otherwise.
-- If the due date is unclear, ask gently after you get the title.
+- If the user gives a date and time, use it directly.
+- If the user gives only a date, default to 11:59 PM unless context suggests
+  otherwise.
+- If the user gives only a relative reference ("next Wednesday", "tomorrow"),
+  resolve it to an exact date using the current datetime in this prompt.
+- Only ask a follow‑up about timing when the deadline is truly unclear.
 
-UPDATING EXISTING TASKS
-- Always call list_events first when modifying or deleting, 
-  so the user can see event IDs.
+UPDATING OR DELETING EXISTING TASKS
+- Use list_events to show candidates when there is any ambiguity about which
+  task to update or delete.
 
 GOAL
-- Make organizing school tasks feel easy, comfortable, and low-stress.
-- Help the user stay on track with clear titles, helpful details, and minimal friction.
+- Make organizing tasks feel easy, fast, and low‑stress.
+- Minimize back‑and‑forth questions.
+- Help the user stay on track with clear titles, helpful details, and minimal
+  friction, while staying warm and encouraging.
+
+REMINDERS & NOTIFICATIONS
+- You CANNOT actually create system reminders, push notifications, or alarms.
+- Do NOT say that you "set" or "added" a reminder in a calendar or device.
+- If the user asks about reminders, you may:
+  - Briefly explain what a reminder is in general terms.
+  - Suggest one or two reasonable reminder times (e.g. 30–60 minutes before).
+  - Clearly say that they need to set the reminder themselves on their
+    preferred device or calendar app.
+- Do NOT bring up reminders on your own unless the user asks about them.
 """
 
     agent = create_agent(

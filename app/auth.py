@@ -1,11 +1,11 @@
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, cast
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 
 from .database import get_db
 from . import models
@@ -35,22 +35,25 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     return encoded_jwt
 
 
-def get_user_by_username(db: Session, username: str) -> Optional[models.User]:
-    return db.query(models.User).filter(models.User.username == username).first()
+def get_user_by_username(db: Database, username: str) -> Optional[models.User]:
+    doc = db["users"].find_one({"username": username})
+    if not doc:
+        return None
+    return cast(models.User, doc)
 
 
-def authenticate_user(db: Session, username: str, password: str) -> Optional[models.User]:
+def authenticate_user(db: Database, username: str, password: str) -> Optional[models.User]:
     user = get_user_by_username(db, username)
     if not user:
         return None
-    if not verify_password(password, user.hashed_password):
+    if not verify_password(password, user["hashed_password"]):
         return None
     return user
 
 
 async def get_current_user(
     token: str = Depends(oauth2_scheme),
-    db: Session = Depends(get_db),
+    db: Database = Depends(get_db),
 ) -> models.User:
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,

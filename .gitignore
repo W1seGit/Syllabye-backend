@@ -23,9 +23,10 @@ __pycache__/
 .env
 .env.*
 
-# Local database
+# Local database/storage
 app.db
 *.sqlite3
+syllabus_files/
 
 # Frontend artifacts / local-only helpers
 chat.html
