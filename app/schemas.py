@@ -9,11 +9,6 @@ class UserCreate(BaseModel):
     password: constr(min_length=6, max_length=128)
 
 
-class UserLogin(BaseModel):
-    username: str
-    password: str
-
-
 class UserOut(BaseModel):
     id: int
     username: str
@@ -73,12 +68,6 @@ class EventOut(EventBase):
 class ChatRequest(BaseModel):
     message: str
     conversation_uuid: Optional[str] = None
-
-
-class ChatResponse(BaseModel):
-    reply: str
-    conversation_uuid: str
-    message_index: int
 
 
 class ConversationOut(BaseModel):

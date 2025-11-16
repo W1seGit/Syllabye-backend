@@ -187,13 +187,13 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Database = Depen
 # --- Chat endpoints ---
 
 
-@app.post("/chat/experimental-stream")
-async def chat_experimental_stream(
+@app.post("/chat")
+async def chat(
     payload: schemas.ChatRequest,
     db: Database = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    """Experimental streaming chat endpoint using agent streaming events."""
+    """Streaming chat endpoint using agent streaming events."""
 
     user_id = _get_user_id(current_user)
     conversation = _get_or_create_conversation(db, user_id, payload.conversation_uuid)

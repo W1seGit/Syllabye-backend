@@ -3,7 +3,7 @@
 A small FastAPI backend that exposes:
 
 - JWT-based auth (`/auth/register`, `/auth/login`)
-- A LangChain-powered calendar/chat agent (`/chat`)
+- A LangChain-powered, **streaming** calendar/chat agent (`/chat`)
 - CRUD endpoints for events (`/events`)
 
 The agent uses OpenAI via `langchain-openai` and a MongoDB database.
@@ -43,7 +43,7 @@ The agent uses OpenAI via `langchain-openai` and a MongoDB database.
    OPENAI_API_KEY=your-openai-key-here
    MONGODB_URI=mongodb://user:password@host:port
    MONGODB_DB_NAME=syllabye
-   # SECRET_KEY=change-me
+   SECRET_KEY=your-strong-random-secret-key
    ```
 
    The app uses `python-dotenv` to load `.env` on startup.
@@ -61,7 +61,7 @@ The API will be available at `http://127.0.0.1:8000`.
 - Interactive docs: `http://127.0.0.1:8000/docs`
 - Health check: `GET /health`
 
-## Auth & Events
+## Auth, Chat & Events
 
 - `POST /auth/register` – create a new user
 - `POST /auth/login` – obtain a JWT access token
