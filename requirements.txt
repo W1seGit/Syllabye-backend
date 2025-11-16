@@ -1,6 +1,5 @@
 fastapi
 uvicorn[standard]
-sqlalchemy
 pydantic
 passlib[bcrypt]
 python-jose[cryptography]
@@ -9,3 +8,4 @@ langchain-openai
 python-dotenv
 python-multipart
 bcrypt==3.2.2
+pymongo

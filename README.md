@@ -6,7 +6,7 @@ A small FastAPI backend that exposes:
 - A LangChain-powered calendar/chat agent (`/chat`)
 - CRUD endpoints for events (`/events`)
 
-The agent uses OpenAI via `langchain-openai` and a SQLite database (`app.db`) via SQLAlchemy.
+The agent uses OpenAI via `langchain-openai` and a MongoDB database.
 
 ## Requirements
 
@@ -41,8 +41,8 @@ The agent uses OpenAI via `langchain-openai` and a SQLite database (`app.db`) vi
 
    ```ini
    OPENAI_API_KEY=your-openai-key-here
-   # Optional overrides
-   # DATABASE_URL=sqlite:///./app.db
+   MONGODB_URI=mongodb://user:password@host:port
+   MONGODB_DB_NAME=syllabye
    # SECRET_KEY=change-me
    ```
 
@@ -93,12 +93,7 @@ The agent:
 - Has short-term per-user memory (recent conversation turns).
 - Manages events only for the authenticated user.
 
-## Database
-
-- Default: SQLite file `app.db` in this folder.
-- It is ignored by git and can be safely deleted/reset in development.
-
 ## Notes
 
 - `.env` and other secrets are ignored by git via `.gitignore`.
-- `app.db` and `chat.html` are local artifacts and are also ignored.
+- `chat.html` is a local artifact and is also ignored.

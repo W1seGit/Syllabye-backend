@@ -1,13 +1,14 @@
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Dict, Optional, cast
 import json
 
-from sqlalchemy.orm import Session
+from pymongo.database import Database
 
 from langchain.agents import create_agent
 from langchain_core.tools import StructuredTool
 
 from . import models
+from .database import get_next_id
 from .llm_providers import get_llm
 
 
@@ -15,7 +16,7 @@ from .llm_providers import get_llm
 
 
 def db_create_event(
-    db: Session,
+    db: Database,
     user_id: int,
     *,
     title: str,
@@ -27,25 +28,30 @@ def db_create_event(
     status: str | None = None,
     priority: str | None = None,
 ) -> str:
-    event = models.Event(
-        title=title,
-        due=due,
-        location=location,
-        description=description,
-        assignment_type=assignment_type,
-        class_name=class_name,
-        status=status,
-        priority=priority,
-        owner_id=user_id,
-    )
-    db.add(event)
-    db.commit()
-    db.refresh(event)
-    return f"Created event id={event.id} titled '{event.title}' due {event.due}"
+    events = db["events"]
+    event_id = get_next_id("events")
+    now = datetime.utcnow()
+    event: models.Event = {
+        "_id": event_id,
+        "id": event_id,
+        "title": title,
+        "due": due,
+        "location": location,
+        "description": description,
+        "assignment_type": assignment_type,
+        "class_name": class_name,
+        "status": status,
+        "priority": priority,
+        "owner_id": user_id,
+        "created_at": now,
+        "updated_at": now,
+    }
+    events.insert_one(event)
+    return f"Created event id={event_id} titled '{title}' due {due}"
 
 
 def db_update_event(
-    db: Session,
+    db: Database,
     user_id: int,
     *,
     event_id: int,
@@ -58,135 +64,134 @@ def db_update_event(
     status: str | None = None,
     priority: str | None = None,
 ) -> str:
-    event = (
-        db.query(models.Event)
-        .filter(models.Event.id == event_id, models.Event.owner_id == user_id)
-        .first()
-    )
+    events = db["events"]
+    event = events.find_one({"id": event_id, "owner_id": user_id})
     if not event:
         return "Event not found for this user."
 
+    update_fields: Dict[str, object] = {}
     if title is not None:
-        event.title = title
+        update_fields["title"] = title
     if due is not None:
-        event.due = due
+        update_fields["due"] = due
     if location is not None:
-        event.location = location
+        update_fields["location"] = location
     if description is not None:
-        event.description = description
+        update_fields["description"] = description
     if assignment_type is not None:
-        event.assignment_type = assignment_type
+        update_fields["assignment_type"] = assignment_type
     if class_name is not None:
-        event.class_name = class_name
+        update_fields["class_name"] = class_name
     if status is not None:
-        event.status = status
+        update_fields["status"] = status
     if priority is not None:
-        event.priority = priority
+        update_fields["priority"] = priority
 
-    db.commit()
-    db.refresh(event)
-    return f"Updated event id={event.id} titled '{event.title}'"
+    if update_fields:
+        update_fields["updated_at"] = datetime.utcnow()
+        events.update_one({"_id": event["_id"]}, {"$set": update_fields})
+        event.update(update_fields)
+
+    return f"Updated event id={event_id} titled '{event.get('title', title or '')}'"
 
 
-def db_delete_event(db: Session, user_id: int, *, event_id: int) -> str:
-    event = (
-        db.query(models.Event)
-        .filter(models.Event.id == event_id, models.Event.owner_id == user_id)
-        .first()
-    )
+def db_delete_event(db: Database, user_id: int, *, event_id: int) -> str:
+    events = db["events"]
+    event = events.find_one({"id": event_id, "owner_id": user_id})
     if not event:
         return "Event not found for this user."
-    db.delete(event)
-    db.commit()
+    events.delete_one({"_id": event["_id"]})
     return f"Deleted event id={event_id}"
 
 
 def db_list_events(
-    db: Session,
+    db: Database,
     user_id: int,
     *,
     date: datetime | None = None,
     title_query: str | None = None,
 ) -> List[models.Event]:
-    q = db.query(models.Event).filter(models.Event.owner_id == user_id)
+    query: Dict[str, object] = {"owner_id": user_id}
     if date is not None:
-        # Filter by same calendar date
-        q = q.filter(models.Event.due.between(
-            date.replace(hour=0, minute=0, second=0, microsecond=0),
-            date.replace(hour=23, minute=59, second=59, microsecond=999999),
-        ))
+        query["due"] = {
+            "$gte": date.replace(hour=0, minute=0, second=0, microsecond=0),
+            "$lte": date.replace(hour=23, minute=59, second=59, microsecond=999999),
+        }
     if title_query:
-        q = q.filter(models.Event.title.ilike(f"%{title_query}%"))
-    return q.order_by(models.Event.due.asc()).all()
+        query["title"] = {"$regex": title_query, "$options": "i"}
+
+    events = db["events"].find(query).sort("due", 1)
+    return [cast(models.Event, e) for e in events]
 
 
 # --- Tool factory ---
 
 
 def make_calendar_tools(
-    db: Session,
+    db: Database,
     user_id: int,
     conversation_uuid: str | None = None,
     message_index: int | None = None,
 ):
     """Create per-user tools so the LLM can never access other users' events.
 
-    conversation_uuid and message_index (if provided) will be attached to tool call logs
-    so that tool executions can be tied back to a specific user message.
+    Backed by MongoDB collections; conversation_uuid and message_index (if provided)
+    are attached to tool call logs.
     """
 
+    classes_col = db["classes"]
+    events_col = db["events"]
+    logs_col = db["tool_call_logs"]
+
     def _ensure_default_class_name() -> str:
-        default_class = (
-            db.query(models.Class)
-            .filter(models.Class.owner_id == user_id, models.Class.name == "Default")
-            .first()
-        )
+        default_class = classes_col.find_one({"owner_id": user_id, "name": "Default"})
         if not default_class:
-            default_class = models.Class(name="Default", owner_id=user_id)
-            db.add(default_class)
-            db.commit()
+            class_id = get_next_id("classes")
+            now = datetime.utcnow()
+            cls: models.Class = {
+                "_id": class_id,
+                "id": class_id,
+                "name": "Default",
+                "owner_id": user_id,
+                "created_at": now,
+                "updated_at": now,
+            }
+            classes_col.insert_one(cls)
         return "Default"
 
     def _validate_class_name(name: str | None) -> str:
         if name is None:
             return _ensure_default_class_name()
-        existing = (
-            db.query(models.Class)
-            .filter(models.Class.owner_id == user_id, models.Class.name == name)
-            .first()
-        )
+        existing = classes_col.find_one({"owner_id": user_id, "name": name})
         if not existing:
-            return (
-                "INVALID_CLASS"
-            )
+            return "INVALID_CLASS"
         return name
 
     def _log_tool_call(tool_name: str, arguments: dict, result: str) -> None:
-        log = models.ToolCallLog(
-            tool_name=tool_name,
-            arguments=json.dumps(arguments, default=str),
-            result=result,
-            conversation_uuid=conversation_uuid,
-            message_index=message_index,
-            owner_id=user_id,
-        )
-        db.add(log)
-        db.commit()
+        log_id = get_next_id("tool_call_logs")
+        now = datetime.utcnow()
+        log: models.ToolCallLog = {
+            "_id": log_id,
+            "id": log_id,
+            "tool_name": tool_name,
+            "arguments": json.dumps(arguments, default=str),
+            "result": result,
+            "conversation_uuid": conversation_uuid,
+            "message_index": message_index,
+            "owner_id": user_id,
+            "created_at": now,
+        }
+        logs_col.insert_one(log)
 
     def list_classes_tool() -> str:
         """List the user's classes by name. Use this before assigning a class_name to a task."""
 
-        classes = (
-            db.query(models.Class)
-            .filter(models.Class.owner_id == user_id)
-            .order_by(models.Class.name.asc())
-            .all()
-        )
+        classes = list(classes_col.find({"owner_id": user_id}).sort("name", 1))
         if not classes:
             result = "No classes found for this user."
             _log_tool_call("list_classes", {}, result)
             return result
-        result = "\n".join(f"id={c.id} | {c.name}" for c in classes)
+        result = "\n".join(f"id={c['id']} | {c['name']}" for c in classes)
         _log_tool_call("list_classes", {}, result)
         return result
 
@@ -196,20 +201,24 @@ def make_calendar_tools(
         Use this if you need a class that does not yet exist before creating a task.
         """
 
-        existing = (
-            db.query(models.Class)
-            .filter(models.Class.owner_id == user_id, models.Class.name == name)
-            .first()
-        )
+        existing = classes_col.find_one({"owner_id": user_id, "name": name})
         if existing:
             result = f"Class '{name}' already exists."
             _log_tool_call("create_class", {"name": name}, result)
             return result
-        new_class = models.Class(name=name, owner_id=user_id)
-        db.add(new_class)
-        db.commit()
-        db.refresh(new_class)
-        result = f"Created class id={new_class.id} name='{new_class.name}'"
+
+        class_id = get_next_id("classes")
+        now = datetime.utcnow()
+        new_class: models.Class = {
+            "_id": class_id,
+            "id": class_id,
+            "name": name,
+            "owner_id": user_id,
+            "created_at": now,
+            "updated_at": now,
+        }
+        classes_col.insert_one(new_class)
+        result = f"Created class id={class_id} name='{name}'"
         _log_tool_call("create_class", {"name": name}, result)
         return result
 
@@ -219,11 +228,7 @@ def make_calendar_tools(
         Use this when the subject name changes (e.g. "Algebra" to "Math").
         """
 
-        cls = (
-            db.query(models.Class)
-            .filter(models.Class.owner_id == user_id, models.Class.name == old_name)
-            .first()
-        )
+        cls = classes_col.find_one({"owner_id": user_id, "name": old_name})
         if not cls:
             result = f"Class '{old_name}' does not exist for this user."
             _log_tool_call(
@@ -233,11 +238,7 @@ def make_calendar_tools(
             )
             return result
 
-        existing_new = (
-            db.query(models.Class)
-            .filter(models.Class.owner_id == user_id, models.Class.name == new_name)
-            .first()
-        )
+        existing_new = classes_col.find_one({"owner_id": user_id, "name": new_name})
         if existing_new:
             result = f"Class '{new_name}' already exists for this user."
             _log_tool_call(
@@ -247,14 +248,14 @@ def make_calendar_tools(
             )
             return result
 
-        cls.name = new_name
-        db.commit()
-
-        db.query(models.Event).filter(
-            models.Event.owner_id == user_id,
-            models.Event.class_name == old_name,
-        ).update({models.Event.class_name: new_name})
-        db.commit()
+        classes_col.update_one(
+            {"_id": cls["_id"]},
+            {"$set": {"name": new_name, "updated_at": datetime.utcnow()}},
+        )
+        events_col.update_many(
+            {"owner_id": user_id, "class_name": old_name},
+            {"$set": {"class_name": new_name}},
+        )
 
         result = f"Renamed class '{old_name}' to '{new_name}' and updated related events."
         _log_tool_call(
@@ -270,22 +271,14 @@ def make_calendar_tools(
         Use with care. This will permanently remove associated events.
         """
 
-        cls = (
-            db.query(models.Class)
-            .filter(models.Class.owner_id == user_id, models.Class.name == name)
-            .first()
-        )
+        cls = classes_col.find_one({"owner_id": user_id, "name": name})
         if not cls:
             result = f"Class '{name}' does not exist for this user."
             _log_tool_call("delete_class", {"name": name}, result)
             return result
 
-        db.query(models.Event).filter(
-            models.Event.owner_id == user_id,
-            models.Event.class_name == name,
-        ).delete(synchronize_session=False)
-        db.delete(cls)
-        db.commit()
+        events_col.delete_many({"owner_id": user_id, "class_name": name})
+        classes_col.delete_one({"_id": cls["_id"]})
 
         result = f"Deleted class '{name}' and all related events."
         _log_tool_call("delete_class", {"name": name}, result)
@@ -582,7 +575,7 @@ def make_calendar_tools(
 
 
 def get_calendar_agent(
-    db: Session,
+    db: Database,
     user_id: int,
     conversation_uuid: str | None = None,
     message_index: int | None = None,
