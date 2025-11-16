@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 
 from .database import get_db, get_next_id
 from . import models, schemas
+from .indexing import index_syllabus_text, index_syllabus_pdf, index_syllabus_images
 from .auth import get_current_user, get_password_hash, authenticate_user, create_access_token
 from .agents import get_calendar_agent
 
@@ -184,87 +185,6 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Database = Depen
 
 
 # --- Chat endpoints ---
-
-
-@app.post("/chat")
-def chat(
-    payload: schemas.ChatRequest,
-    db: Database = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-):
-    """Streaming chat endpoint using the calendar agent."""
-
-    user_id = _get_user_id(current_user)
-    conversation = _get_or_create_conversation(db, user_id, payload.conversation_uuid)
-
-    db_history = _get_chat_history(db, user_id, conversation["id"])
-    history_messages = [{"role": m["role"], "content": m["content"]} for m in db_history]
-    if len(history_messages) > 10:
-        history_messages = history_messages[-10:]
-
-    next_index = db_history[-1]["message_index"] + 1 if db_history else 1
-
-    messages_input = history_messages + [
-        {"role": "user", "content": payload.message},
-    ]
-
-    agent = get_calendar_agent(
-        db=db,
-        user_id=user_id,
-        conversation_uuid=conversation["uuid"],
-        message_index=next_index,
-    )
-
-    result = agent.invoke({"messages": messages_input})
-    messages = result.get("messages") or []
-    if not messages:
-        raise HTTPException(status_code=500, detail="Agent returned no messages")
-
-    last_message = messages[-1]
-    reply_text = getattr(last_message, "content", None) or last_message.get("content", "")
-
-    def event_stream():
-        try:
-            chunk_size = 128
-            for i in range(0, len(reply_text), chunk_size):
-                yield reply_text[i : i + chunk_size]
-        finally:
-            messages_col = db["chat_messages"]
-            now = datetime.utcnow()
-            user_msg_id = get_next_id("chat_messages")
-            assistant_msg_id = get_next_id("chat_messages")
-            messages_col.insert_many(
-                [
-                    {
-                        "_id": user_msg_id,
-                        "id": user_msg_id,
-                        "role": "user",
-                        "content": payload.message,
-                        "message_index": next_index,
-                        "conversation_id": conversation["id"],
-                        "conversation_uuid": conversation["uuid"],
-                        "owner_id": user_id,
-                        "created_at": now,
-                    },
-                    {
-                        "_id": assistant_msg_id,
-                        "id": assistant_msg_id,
-                        "role": "assistant",
-                        "content": reply_text,
-                        "message_index": next_index + 1,
-                        "conversation_id": conversation["id"],
-                        "conversation_uuid": conversation["uuid"],
-                        "owner_id": user_id,
-                        "created_at": now,
-                    },
-                ]
-            )
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/plain",
-        headers={"X-Conversation-UUID": conversation["uuid"]},
-    )
 
 
 @app.post("/chat/experimental-stream")
@@ -537,6 +457,16 @@ def update_class_syllabus_text(
     )
     syllabus["text"] = payload.text
     syllabus["updated_at"] = now
+
+    # Index updated text into vectors
+    user_id = _get_user_id(current_user)
+    index_syllabus_text(
+        db,
+        owner_id=user_id,
+        class_id=class_id,
+        syllabus_id=syllabus["id"],
+        text=payload.text,
+    )
     return _syllabus_to_response(db, syllabus)
 
 
@@ -580,6 +510,16 @@ def upload_class_syllabus_pdf(
     )
     syllabus["pdf_path"] = dest_path
     syllabus["updated_at"] = now
+
+    # Index PDF content into vectors
+    user_id = _get_user_id(current_user)
+    index_syllabus_pdf(
+        db,
+        owner_id=user_id,
+        class_id=class_id,
+        syllabus_id=syllabus["id"],
+        pdf_path=dest_path,
+    )
     return _syllabus_to_response(db, syllabus)
 
 
@@ -631,6 +571,8 @@ def upload_class_syllabus_images(
     images_col = db["class_syllabus_images"]
     now = datetime.utcnow()
 
+    image_paths: List[str] = []
+
     for f in files:
         ext = os.path.splitext(f.filename or "")[1] or ".png"
         filename = f"img_{datetime.utcnow().timestamp()}_{f.filename}"
@@ -639,6 +581,8 @@ def upload_class_syllabus_images(
         with open(dest_path, "wb") as out_file:
             content = f.file.read()
             out_file.write(content)
+
+        image_paths.append(dest_path)
 
         img_id = get_next_id("class_syllabus_images")
         img: models.ClassSyllabusImage = {
@@ -655,6 +599,16 @@ def upload_class_syllabus_images(
         {"_id": syllabus["_id"]},
         {"$set": {"updated_at": datetime.utcnow()}},
     )
+
+    if image_paths:
+        user_id = _get_user_id(current_user)
+        index_syllabus_images(
+            db,
+            owner_id=user_id,
+            class_id=class_id,
+            syllabus_id=syllabus["id"],
+            image_paths=image_paths,
+        )
 
     updated = syllabi.find_one({"_id": syllabus["_id"]})
     return _syllabus_to_response(db, cast(models.ClassSyllabus, updated))
