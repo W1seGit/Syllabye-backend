@@ -21,6 +21,7 @@ class ClassSyllabus(TypedDict, total=False):
     id: int
     text: Optional[str]
     pdf_path: Optional[str]
+    summary: Optional[str]
     class_id: int
     owner_id: int
     created_at: datetime

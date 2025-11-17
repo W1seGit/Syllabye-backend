@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, cast
+from typing import List, Dict, Optional, Any, cast
 import json
 
 from pymongo.database import Database
@@ -821,3 +821,148 @@ EMOTION RADAR
         system_prompt=system_prompt,
     )
     return agent
+
+
+def run_syllabus_agent(
+    db: Database,
+    *,
+    user_id: int,
+    class_name: str,
+    syllabus_text: str,
+) -> Optional[str]:
+    if not syllabus_text.strip():
+        return None
+
+    llm = get_llm()
+    now_iso = datetime.now().isoformat()
+
+    system_prompt = (
+        "You are an assistant that reads full course syllabi and extracts a clear, detailed "
+        "schedule of assignments, exams, quizzes, and other important dates.\n\n"
+        "You must respond ONLY with valid JSON using this exact schema (no comments, no extra keys):\n"
+        "{\n"
+        "  \"summary\": \"string\",\n"
+        "  \"events\": [\n"
+        "    {\n"
+        "      \"title\": \"string\",\n"
+        "      \"due_iso\": \"string\",\n"
+        "      \"location\": \"string or null\",\n"
+        "      \"description\": \"string or null\",\n"
+        "      \"assignment_type\": \"string or null\"\n"
+        "    }\n"
+        "  ]\n"
+        "}\n\n"
+        "SUMMARY REQUIREMENTS\n"
+        "- 3-8 sentences.\n"
+        "- Mention overall course structure, major graded components (projects, exams, quizzes),\n"
+        "  and how the timeline is organized (e.g., weekly topics, midterm timing, final project).\n\n"
+        "EVENT REQUIREMENTS\n"
+        "- Include one event for EACH clearly dated major graded item: exams, midterms, finals,\n"
+        "  projects, papers, presentations, or important deadlines.\n"
+        "- Optional: include recurring weekly events only if they are explicitly scheduled.\n"
+        "- Use ISO-8601 for due_iso. If the syllabus only gives a date (YYYY-MM-DD), set the time\n"
+        "  to 23:59.\n"
+        "- Examples of valid due_iso: \"2025-10-03T23:59:00\", \"2025-11-15T09:00:00-05:00\".\n\n"
+        "IMPORTANT\n"
+        "- Output MUST be valid JSON: no trailing commas, no comments, no explanation outside the JSON.\n"
+        "- If you are unsure of an exact date, do not invent one; skip that event instead."
+    )
+
+    user_prompt = (
+        "Current datetime (ISO): "
+        + now_iso
+        + "\nClass name: "
+        + class_name
+        + "\n\nFull syllabus text follows:\n\n"
+        + syllabus_text
+    )
+
+    message = llm.invoke(
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+    )
+
+    content: Any = getattr(message, "content", None)
+    if not content:
+        return None
+    if isinstance(content, list):
+        parts: List[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        content_text = "".join(parts).strip()
+    elif isinstance(content, str):
+        content_text = content.strip()
+    else:
+        content_text = str(content).strip()
+
+    if not content_text:
+        return None
+
+    # Try to be robust if the model accidentally adds text around the JSON
+    json_text = content_text
+    first_brace = content_text.find("{")
+    last_brace = content_text.rfind("}")
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        json_text = content_text[first_brace : last_brace + 1]
+
+    try:
+        payload = json.loads(json_text)
+    except Exception:
+        return None
+
+    summary = payload.get("summary")
+    events_data = payload.get("events") or []
+
+    if isinstance(events_data, list):
+        for item in events_data:
+            if not isinstance(item, dict):
+                continue
+            title = item.get("title")
+            due_iso = item.get("due_iso")
+            if not isinstance(title, str) or not title.strip():
+                continue
+            if not isinstance(due_iso, str) or not due_iso.strip():
+                continue
+            normalized_due = due_iso.strip()
+            # Handle common variants like a bare date or Z-terminated timestamp
+            if len(normalized_due) == 10 and normalized_due[4] == "-" and normalized_due[7] == "-":
+                normalized_due = normalized_due + "T23:59:00"
+            if normalized_due.endswith("Z"):
+                normalized_due = normalized_due[:-1] + "+00:00"
+            try:
+                due_dt = datetime.fromisoformat(normalized_due)
+            except Exception:
+                continue
+            location = item.get("location")
+            if location is not None and not isinstance(location, str):
+                location = None
+            description = item.get("description")
+            if description is not None and not isinstance(description, str):
+                description = None
+            assignment_type = item.get("assignment_type")
+            if assignment_type is not None and not isinstance(assignment_type, str):
+                assignment_type = None
+
+            db_create_event(
+                db,
+                user_id,
+                title=title.strip(),
+                due=due_dt,
+                location=location,
+                description=description,
+                assignment_type=assignment_type,
+                class_name=class_name,
+                status="pending",
+                priority="normal",
+            )
+
+    if isinstance(summary, str) and summary.strip():
+        return summary.strip()
+    return None

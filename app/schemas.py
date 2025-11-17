@@ -98,6 +98,7 @@ class ClassSyllabusOut(BaseModel):
     text: Optional[str] = None
     pdf_path: Optional[str] = None
     images: List[ClassSyllabusImageOut] = []
+    summary: Optional[str] = None
 
     class Config:
         orm_mode = True

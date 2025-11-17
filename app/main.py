@@ -13,7 +13,7 @@ from .database import get_db, get_next_id
 from . import models, schemas
 from .indexing import index_syllabus_text, index_syllabus_pdf, index_syllabus_images
 from .auth import get_current_user, get_password_hash, authenticate_user, create_access_token
-from .agents import get_calendar_agent
+from .agents import get_calendar_agent, run_syllabus_agent
 
 
 load_dotenv()
@@ -91,11 +91,76 @@ def _syllabus_to_response(db: Database, syllabus: models.ClassSyllabus) -> dict:
         "class_id": syllabus["class_id"],
         "text": syllabus.get("text"),
         "pdf_path": syllabus.get("pdf_path"),
+        "summary": syllabus.get("summary"),
         "images": [
             {"id": img["id"], "file_path": img["file_path"]}
             for img in images
         ],
     }
+
+
+def _run_syllabus_ai(
+    db: Database,
+    *,
+    user_id: int,
+    class_id: int,
+    syllabus: models.ClassSyllabus,
+) -> None:
+    classes = db["classes"]
+    cls = classes.find_one({"id": class_id, "owner_id": user_id})
+    if not cls:
+        return
+
+    syllabus_text: str | None = None
+    raw_text = syllabus.get("text")
+    if isinstance(raw_text, str) and raw_text.strip():
+        syllabus_text = raw_text
+    else:
+        chunks_col = db["syllabus_chunks"]
+        cursor = chunks_col.find(
+            {
+                "owner_id": user_id,
+                "class_id": class_id,
+                "syllabus_id": syllabus["id"],
+            }
+        ).sort("chunk_index", 1)
+        parts: list[str] = []
+        total_len = 0
+        for doc in cursor:
+            text = str(doc.get("text", ""))
+            if not text.strip():
+                continue
+            parts.append(text)
+            total_len += len(text)
+            if total_len > 20000:
+                break
+        if parts:
+            syllabus_text = "\n\n".join(parts)
+
+    if not syllabus_text:
+        return
+
+    try:
+        summary = run_syllabus_agent(
+            db=db,
+            user_id=user_id,
+            class_name=str(cls.get("name", "")),
+            syllabus_text=syllabus_text,
+        )
+    except Exception:
+        return
+
+    if not summary:
+        return
+
+    syllabi = db["class_syllabi"]
+    now = datetime.utcnow()
+    syllabi.update_one(
+        {"_id": syllabus["_id"]},
+        {"$set": {"summary": summary, "updated_at": now}},
+    )
+    syllabus["summary"] = summary
+    syllabus["updated_at"] = now
 
 
 def _get_or_create_syllabus(
@@ -467,6 +532,13 @@ def update_class_syllabus_text(
         syllabus_id=syllabus["id"],
         text=payload.text,
     )
+
+    _run_syllabus_ai(
+        db,
+        user_id=user_id,
+        class_id=class_id,
+        syllabus=syllabus,
+    )
     return _syllabus_to_response(db, syllabus)
 
 
@@ -519,6 +591,13 @@ def upload_class_syllabus_pdf(
         class_id=class_id,
         syllabus_id=syllabus["id"],
         pdf_path=dest_path,
+    )
+
+    _run_syllabus_ai(
+        db,
+        user_id=user_id,
+        class_id=class_id,
+        syllabus=syllabus,
     )
     return _syllabus_to_response(db, syllabus)
 
@@ -608,6 +687,13 @@ def upload_class_syllabus_images(
             class_id=class_id,
             syllabus_id=syllabus["id"],
             image_paths=image_paths,
+        )
+
+        _run_syllabus_ai(
+            db,
+            user_id=user_id,
+            class_id=class_id,
+            syllabus=syllabus,
         )
 
     updated = syllabi.find_one({"_id": syllabus["_id"]})
