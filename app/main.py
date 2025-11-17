@@ -414,9 +414,38 @@ async def chat_ws(websocket: WebSocket, db: Database = Depends(get_db)):
     full_reply = ""
     try:
         async for event in agent.astream_events({"messages": messages_input}):
-            if event.get("event") != "on_chat_model_stream":
-                continue
+            evt_type = event.get("event")
             data = event.get("data") or {}
+
+            if evt_type in {"on_tool_start", "on_tool_end"}:
+                try:
+                    name = event.get("name") or data.get("name") or "tool"
+                    if evt_type == "on_tool_start":
+                        args = data.get("input")
+                        await websocket.send_json(
+                            {
+                                "type": "tool",
+                                "phase": "start",
+                                "tool_name": name,
+                                "args": args,
+                            }
+                        )
+                    else:
+                        result = data.get("output")
+                        await websocket.send_json(
+                            {
+                                "type": "tool",
+                                "phase": "end",
+                                "tool_name": name,
+                                "result": result,
+                            }
+                        )
+                except Exception:
+                    pass
+                continue
+
+            if evt_type != "on_chat_model_stream":
+                continue
             chunk = data.get("chunk")
             if chunk is None:
                 continue
