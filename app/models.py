@@ -45,6 +45,8 @@ class Event(TypedDict, total=False):
     class_name: Optional[str]
     status: Optional[str]
     priority: Optional[str]
+    syllabus_id: Optional[int]
+    source: Optional[str]
     owner_id: int
     created_at: datetime
     updated_at: datetime

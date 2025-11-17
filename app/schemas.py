@@ -60,6 +60,8 @@ class EventUpdate(BaseModel):
 
 class EventOut(EventBase):
     id: int
+    syllabus_id: Optional[int] = None
+    source: Optional[str] = None
 
     class Config:
         orm_mode = True

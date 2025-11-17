@@ -146,6 +146,7 @@ def _run_syllabus_ai(
             user_id=user_id,
             class_name=str(cls.get("name", "")),
             syllabus_text=syllabus_text,
+            syllabus_id=syllabus.get("id"),
         )
     except Exception:
         return
@@ -782,6 +783,8 @@ def create_event(
         "class_name": class_name,
         "status": status_value,
         "priority": event_in.priority,
+        "syllabus_id": None,
+        "source": "user",
         "owner_id": user_id,
         "created_at": now,
         "updated_at": now,
@@ -798,6 +801,8 @@ def create_event(
         "class_name": event_doc.get("class_name"),
         "status": event_doc.get("status"),
         "priority": event_doc.get("priority"),
+        "syllabus_id": event_doc.get("syllabus_id"),
+        "source": event_doc.get("source"),
     }
 
 
@@ -828,6 +833,8 @@ def list_events(
             "class_name": e.get("class_name"),
             "status": e.get("status"),
             "priority": e.get("priority"),
+            "syllabus_id": e.get("syllabus_id"),
+            "source": e.get("source"),
         }
         for e in events
     ]
@@ -855,6 +862,8 @@ def get_event(
         "class_name": event.get("class_name"),
         "status": event.get("status"),
         "priority": event.get("priority"),
+        "syllabus_id": event.get("syllabus_id"),
+        "source": event.get("source"),
     }
 
 

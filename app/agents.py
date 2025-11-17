@@ -28,6 +28,8 @@ def db_create_event(
     class_name: str | None = None,
     status: str | None = None,
     priority: str | None = None,
+    syllabus_id: int | None = None,
+    source: str | None = None,
 ) -> str:
     events = db["events"]
     event_id = get_next_id("events")
@@ -43,6 +45,8 @@ def db_create_event(
         "class_name": class_name,
         "status": status,
         "priority": priority,
+        "syllabus_id": syllabus_id,
+        "source": source,
         "owner_id": user_id,
         "created_at": now,
         "updated_at": now,
@@ -481,6 +485,8 @@ def make_calendar_tools(
             class_name=validated_class,
             status=final_status,
             priority=final_priority,
+            syllabus_id=None,
+            source="user",
         )
 
         _log_tool_call(
@@ -829,6 +835,7 @@ def run_syllabus_agent(
     user_id: int,
     class_name: str,
     syllabus_text: str,
+    syllabus_id: int | None,
 ) -> Optional[str]:
     if not syllabus_text.strip():
         return None
@@ -961,6 +968,8 @@ def run_syllabus_agent(
                 class_name=class_name,
                 status="pending",
                 priority="normal",
+                syllabus_id=syllabus_id,
+                source="syllabus_ai",
             )
 
     if isinstance(summary, str) and summary.strip():
