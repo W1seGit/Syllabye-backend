@@ -1,10 +1,13 @@
-# Calendar AI Backend
+# Syllabye Backend
 
-A small FastAPI backend that exposes:
+FastAPI backend that powers the Syllabye app. It exposes:
 
 - JWT-based auth (`/auth/register`, `/auth/login`)
-- A LangChain-powered, **streaming** calendar/chat agent (`/chat`)
+- A LangChain-powered, **streaming** calendar/chat agent
+  - HTTP streaming endpoint: `POST /chat`
+  - WebSocket streaming endpoint: `GET /chat/ws`
 - CRUD endpoints for events (`/events`)
+- Class/syllabus management endpoints used by the mobile app
 
 The agent uses OpenAI via `langchain-openai` and a MongoDB database.
 
@@ -73,7 +76,21 @@ Event endpoints:
 - `GET /events` – list events (optionally by date)
 - `GET /events/{id}` – get single event
 - `PATCH /events/{id}` – update event
-- `DELETE /events/{id}` – delete event
+-- `DELETE /events/{id}` – delete event
+
+Chat endpoints:
+
+- `POST /chat` – streaming response over HTTP (used as a fallback by clients)
+- `GET /chat/ws` – WebSocket chat with token streaming and live tool-call events
+
+## Technologies
+
+- **FastAPI** – web framework and dependency injection
+- **Uvicorn** – ASGI server for running the API
+- **MongoDB** – persistence for users, classes, events, tool logs, etc.
+- **LangChain / langchain-openai** – LLM orchestration and tools for the calendar agent
+- **python-dotenv** – loads environment variables from `.env`
+- **python-jose** – JWT creation and verification for auth
 
 ## Chat UI (local helper)
 
