@@ -9,10 +9,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # Install system dependencies (if you need others later, add them here)
-# Note: libgl1 is required by OpenCV (cv2) used transitively by docling's PDF pipeline.
+# Note: libgl1 and libglib2.0-0 are required by OpenCV (cv2) used transitively by docling's PDF pipeline.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         libgl1 \
+        libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies first (better build cache)
