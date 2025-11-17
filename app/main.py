@@ -2,7 +2,7 @@ from datetime import datetime, date
 from typing import Dict, List, Optional, cast
 import os
 
-from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,8 +12,17 @@ from dotenv import load_dotenv
 from .database import get_db, get_next_id
 from . import models, schemas
 from .indexing import index_syllabus_text, index_syllabus_pdf, index_syllabus_images
-from .auth import get_current_user, get_password_hash, authenticate_user, create_access_token
+from .auth import (
+    get_current_user,
+    get_password_hash,
+    authenticate_user,
+    create_access_token,
+    get_user_by_username,
+    SECRET_KEY,
+    ALGORITHM,
+)
 from .agents import get_calendar_agent, run_syllabus_agent
+from jose import JWTError, jwt
 
 
 load_dotenv()
@@ -336,6 +345,125 @@ async def chat(
         media_type="text/plain",
         headers={"X-Conversation-UUID": conversation["uuid"]},
     )
+
+
+@app.websocket("/chat/ws")
+async def chat_ws(websocket: WebSocket, db: Database = Depends(get_db)):
+    await websocket.accept()
+
+    token = websocket.query_params.get("token")
+    conversation_uuid = websocket.query_params.get("conversation_uuid")
+
+    if not token:
+        await websocket.close(code=4401)
+        return
+
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = payload.get("sub")
+        if not username:
+            raise JWTError()
+    except JWTError:
+        await websocket.close(code=4401)
+        return
+
+    current_user = get_user_by_username(db, username=username)
+    if not current_user:
+        await websocket.close(code=4401)
+        return
+
+    user_id = _get_user_id(current_user)
+
+    try:
+        msg_data = await websocket.receive_json()
+    except WebSocketDisconnect:
+        await websocket.close()
+        return
+    except Exception:
+        await websocket.close(code=4400)
+        return
+
+    message_text = msg_data.get("message")
+    incoming_conversation_uuid = msg_data.get("conversation_uuid") or conversation_uuid
+    if not isinstance(message_text, str) or not message_text.strip():
+        await websocket.close(code=4400)
+        return
+
+    conversation = _get_or_create_conversation(db, user_id, incoming_conversation_uuid)
+
+    db_history = _get_chat_history(db, user_id, conversation["id"])
+    history_messages = [{"role": m["role"], "content": m["content"]} for m in db_history]
+    if len(history_messages) > 10:
+        history_messages = history_messages[-10:]
+
+    next_index = db_history[-1]["message_index"] + 1 if db_history else 1
+
+    messages_input = history_messages + [
+        {"role": "user", "content": message_text},
+    ]
+
+    agent = get_calendar_agent(
+        db=db,
+        user_id=user_id,
+        conversation_uuid=conversation["uuid"],
+        message_index=next_index,
+    )
+
+    await websocket.send_json({"type": "meta", "conversation_uuid": conversation["uuid"]})
+
+    full_reply = ""
+    try:
+        async for event in agent.astream_events({"messages": messages_input}):
+            if event.get("event") != "on_chat_model_stream":
+                continue
+            data = event.get("data") or {}
+            chunk = data.get("chunk")
+            if chunk is None:
+                continue
+            text = getattr(chunk, "content", "") or ""
+            if not text:
+                continue
+            full_reply += text
+            await websocket.send_text(text)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        messages_col = db["chat_messages"]
+        now = datetime.utcnow()
+        user_msg_id = get_next_id("chat_messages")
+        assistant_msg_id = get_next_id("chat_messages")
+        messages_col.insert_many(
+            [
+                {
+                    "_id": user_msg_id,
+                    "id": user_msg_id,
+                    "role": "user",
+                    "content": message_text,
+                    "message_index": next_index,
+                    "conversation_id": conversation["id"],
+                    "conversation_uuid": conversation["uuid"],
+                    "owner_id": user_id,
+                    "created_at": now,
+                },
+                {
+                    "_id": assistant_msg_id,
+                    "id": assistant_msg_id,
+                    "role": "assistant",
+                    "content": full_reply,
+                    "message_index": next_index + 1,
+                    "conversation_id": conversation["id"],
+                    "conversation_uuid": conversation["uuid"],
+                    "owner_id": user_id,
+                    "created_at": now,
+                },
+            ]
+        )
+
+    try:
+        await websocket.send_json({"type": "done"})
+    except Exception:
+        pass
+    await websocket.close()
 
 
 @app.get("/conversations", response_model=List[schemas.ConversationOut])
